@@ -113,40 +113,62 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
         }
     }
 
-    pub fn from_leaves(version: u64, leaves: &[(&[u8], &[u8])]) -> Self {
+    pub fn from_leaves<K, V>(version: u64, leaves: &[(K, V)]) -> Self
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let mut tree = Self::new(version);
         tree.batch_insert(leaves);
         tree
     }
 
-    pub fn insert(&mut self, key: &[u8], data: &[u8]) {
-        let value_hash = H::hash_leaf_with_key(key, data);
-        self.leaves.insert(key.to_vec(), value_hash);
+    pub fn insert<K, V>(&mut self, key: K, data: V)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let key_ref = key.as_ref();
+        let data_ref = data.as_ref();
+        let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
+        self.leaves.insert(key_ref.to_vec(), value_hash);
         self.update_root();
     }
 
-    pub fn batch_insert(&mut self, items: &[(&[u8], &[u8])]) {
+    pub fn batch_insert<K, V>(&mut self, items: &[(K, V)])
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         for (key, data) in items {
-            let value_hash = H::hash_leaf_with_key(key, data);
-            self.leaves.insert(key.to_vec(), value_hash);
+            let key_ref = key.as_ref();
+            let data_ref = data.as_ref();
+            let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
+            self.leaves.insert(key_ref.to_vec(), value_hash);
         }
         self.update_root();
     }
 
-    pub fn update(&mut self, key: &[u8], data: &[u8]) -> Result<(), JMTError> {
-        let key_vec = key.to_vec();
+    pub fn update<K, V>(&mut self, key: K, data: V) -> Result<(), JMTError>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let key_ref = key.as_ref();
+        let key_vec = key_ref.to_vec();
         if self.leaves.contains_key(&key_vec) {
-            let value_hash = H::hash_leaf_with_key(key, data);
+            let data_ref = data.as_ref();
+            let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
             self.leaves.insert(key_vec, value_hash);
             self.update_root();
             Ok(())
         } else {
-            Err(JMTError::KeyNotFound(key.to_vec()))
+            Err(JMTError::KeyNotFound(key_ref.to_vec()))
         }
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> bool {
-        let key_vec = key.to_vec();
+    pub fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> bool {
+        let key_vec = key.as_ref().to_vec();
         if self.leaves.remove(&key_vec).is_some() {
             self.update_root();
             true
@@ -155,10 +177,13 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
         }
     }
 
-    pub fn batch_remove(&mut self, keys: &[&[u8]]) -> usize {
+    pub fn batch_remove<K>(&mut self, keys: &[K]) -> usize
+    where
+        K: AsRef<[u8]>,
+    {
         let mut removed_count = 0;
         for key in keys {
-            let key_vec = key.to_vec();
+            let key_vec = key.as_ref().to_vec();
             if self.leaves.remove(&key_vec).is_some() {
                 removed_count += 1;
             }
@@ -171,16 +196,16 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
         removed_count
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<H::Output, JMTError> {
-        let key_vec = key.to_vec();
+    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<H::Output, JMTError> {
+        let key_vec = key.as_ref().to_vec();
         self.leaves
             .get(&key_vec)
             .copied()
-            .ok_or_else(|| JMTError::KeyNotFound(key.to_vec()))
+            .ok_or_else(|| JMTError::KeyNotFound(key.as_ref().to_vec()))
     }
 
-    pub fn contains(&self, key: &[u8]) -> bool {
-        let key_vec = key.to_vec();
+    pub fn contains<K: AsRef<[u8]>>(&self, key: K) -> bool {
+        let key_vec = key.as_ref().to_vec();
         self.leaves.contains_key(&key_vec)
     }
 
@@ -238,18 +263,19 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
         max_len
     }
 
-    pub fn prove(&self, key: &[u8]) -> JMTProof<H> {
-        let mut siblings = Vec::new();
-        let key_vec = key.to_vec();
+    pub fn prove<K: AsRef<[u8]>>(&self, key: K) -> JMTProof<H> {
+        let key_slice = key.as_ref();
+        let key_vec = key_slice.to_vec();
         let leaf_data = self.leaves.get(&key_vec).copied();
+        let mut siblings = Vec::new();
 
         if let Some(_value_hash) = leaf_data {
             // Inclusion proof
-            let current_key = key;
+            let current_key = key_slice;
             let mut remaining_leaves: Vec<(&Vec<u8>, &H::Output)> = self
                 .leaves
                 .iter()
-                .filter(|(k, _)| k.as_slice() != key)
+                .filter(|(k, _)| k.as_slice() != key_slice)
                 .collect();
 
             let mut level = 0;
@@ -264,22 +290,26 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
             }
         } else {
             // Exclusion proof
-            if let Some((closest_key, closest_hash)) = self.find_closest_leaf(key) {
-                siblings = self.generate_exclusion_proof(key, closest_key, *closest_hash);
+            if let Some((closest_key, closest_hash)) = self.find_closest_leaf(key_slice) {
+                siblings = self.generate_exclusion_proof(key_slice, closest_key, *closest_hash);
             }
         }
 
         JMTProof {
-            leaf: leaf_data.map(|hash| (key.to_vec(), hash)),
+            leaf: leaf_data.map(|hash| (key_slice.to_vec(), hash)),
             siblings,
         }
     }
 
-    pub fn prove_non_membership_with_range(&self, key: &[u8]) -> JMTNonMembershipProof<H> {
-        let (predecessor, successor) = self.find_adjacent_leaves(key);
+    pub fn prove_non_membership_with_range<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+    ) -> JMTNonMembershipProof<H> {
+        let key_slice = key.as_ref();
+        let (predecessor, successor) = self.find_adjacent_leaves(key_slice);
 
         JMTNonMembershipProof {
-            key: key.to_vec(),
+            key: key_slice.to_vec(),
             predecessor: predecessor.map(|(k, v)| (k.clone(), *v)),
             successor: successor.map(|(k, v)| (k.clone(), *v)),
             root: self.root,
@@ -404,44 +434,54 @@ impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
 
 // JMTProof implementation
 impl<H: Hasher> JMTProof<H> {
-    pub fn verify(&self, root: H::Output, key: &[u8], value: Option<&[u8]>) -> bool {
+    pub fn verify<K, V>(&self, root: H::Output, key: K, value: Option<V>) -> bool
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let key_ref = key.as_ref();
         match (&self.leaf, value) {
             (Some((leaf_key, leaf_hash)), Some(value_data)) => {
                 // Inclusion proof verification
-                if leaf_key != key {
+                if leaf_key != key_ref {
                     return false;
                 }
 
-                let computed_hash = H::hash_leaf_with_key(key, value_data);
+                let computed_hash = H::hash_leaf_with_key(key_ref, value_data.as_ref());
                 if computed_hash != *leaf_hash {
                     return false;
                 }
 
-                self.verify_siblings(*leaf_hash, root, key)
+                self.verify_siblings(*leaf_hash, root, key_ref)
             }
             (Some((leaf_key, leaf_hash)), None) => {
                 // Exclusion proof with existing leaf
-                if leaf_key == key {
+                if leaf_key == key_ref {
                     return false;
                 }
                 self.verify_siblings(*leaf_hash, root, leaf_key)
             }
             (None, None) => {
                 // Exclusion proof with empty subtree
-                self.verify_siblings(H::empty_hash(), root, key)
+                self.verify_siblings(H::empty_hash(), root, key_ref)
             }
             (None, Some(_)) => false,
         }
     }
 
-    pub fn verify_enhanced(
+    pub fn verify_enhanced<K, V>(
         &self,
         root: H::Output,
-        key: &[u8],
-        value: Option<&[u8]>,
+        key: K,
+        value: Option<V>,
         version: u64,
-    ) -> bool {
-        if !self.verify(root, key, value) {
+    ) -> bool
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let key_ref = key.as_ref();
+        if !self.verify(root, key_ref, value.as_ref().map(|v| v.as_ref())) {
             return false;
         }
 
@@ -450,18 +490,18 @@ impl<H: Hasher> JMTProof<H> {
             return false;
         }
 
-        let expected_path_length = key.len() * 8;
+        let expected_path_length = key_ref.len() * 8;
         if self.siblings.len() > expected_path_length {
             return false;
         }
 
         if let Some((leaf_key, leaf_hash)) = &self.leaf {
-            if value.is_some() && leaf_key != key {
+            if value.is_some() && leaf_key != key_ref {
                 return false;
             }
 
             if let Some(data) = value {
-                let leaf_data_hash = H::hash_leaf_with_key(key, data);
+                let leaf_data_hash = H::hash_leaf_with_key(key_ref, data.as_ref());
                 let computed_hash = H::hash_with_version(version, leaf_data_hash.as_ref());
                 if computed_hash != *leaf_hash {
                     return false;
@@ -613,9 +653,9 @@ impl<H: Hasher> VersionedJMTStorage<H> {
 pub trait JMTDatabase<H: Hasher> {
     fn get_root(&self, version: u64) -> Result<Option<H::Output>, JMTError>;
     fn set_root(&mut self, version: u64, root: H::Output) -> Result<(), JMTError>;
-    fn get_leaf(&self, key: &[u8]) -> Result<Option<H::Output>, JMTError>;
-    fn set_leaf(&mut self, key: &[u8], hash: H::Output) -> Result<(), JMTError>;
-    fn delete_leaf(&mut self, key: &[u8]) -> Result<bool, JMTError>;
+    fn get_leaf<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<H::Output>, JMTError>;
+    fn set_leaf<K: AsRef<[u8]>>(&mut self, key: K, hash: H::Output) -> Result<(), JMTError>;
+    fn delete_leaf<K: AsRef<[u8]>>(&mut self, key: K) -> Result<bool, JMTError>;
     fn get_version(&self) -> Result<u64, JMTError>;
     fn set_version(&mut self, version: u64) -> Result<(), JMTError>;
 }
@@ -649,18 +689,18 @@ impl<H: Hasher> JMTDatabase<H> for MemoryJMTDatabase<H> {
         Ok(())
     }
 
-    fn get_leaf(&self, key: &[u8]) -> Result<Option<H::Output>, JMTError> {
-        let key_vec = key.to_vec();
+    fn get_leaf<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<H::Output>, JMTError> {
+        let key_vec = key.as_ref().to_vec();
         Ok(self.leaves.get(&key_vec).copied())
     }
 
-    fn set_leaf(&mut self, key: &[u8], hash: H::Output) -> Result<(), JMTError> {
-        self.leaves.insert(key.to_vec(), hash);
+    fn set_leaf<K: AsRef<[u8]>>(&mut self, key: K, hash: H::Output) -> Result<(), JMTError> {
+        self.leaves.insert(key.as_ref().to_vec(), hash);
         Ok(())
     }
 
-    fn delete_leaf(&mut self, key: &[u8]) -> Result<bool, JMTError> {
-        let key_vec = key.to_vec();
+    fn delete_leaf<K: AsRef<[u8]>>(&mut self, key: K) -> Result<bool, JMTError> {
+        let key_vec = key.as_ref().to_vec();
         Ok(self.leaves.remove(&key_vec).is_some())
     }
 
@@ -796,11 +836,11 @@ mod tests {
 
         // Test insertion
         tree.insert(b"key1", b"value1");
-        tree.insert(b"key2", b"value2");
+        tree.insert("key2", "value2"); // Using string slices
 
         assert_eq!(tree.leaf_count(), 2);
         assert!(tree.contains(b"key1"));
-        assert!(tree.contains(b"key2"));
+        assert!(tree.contains("key2")); // Using string slice
         assert!(!tree.contains(b"key3"));
 
         // Test retrieval
@@ -815,7 +855,7 @@ mod tests {
         assert_eq!(new_hash1, expected_new_hash1);
 
         // Test removal
-        assert!(tree.remove(b"key2"));
+        assert!(tree.remove("key2")); // Using string slice
         assert!(!tree.contains(b"key2"));
         assert_eq!(tree.leaf_count(), 1);
     }
@@ -832,6 +872,9 @@ mod tests {
         assert!(proof.verify(tree.root(), b"key1", Some(b"value1")));
         assert!(!proof.verify(tree.root(), b"key1", Some(b"wrong_value")));
         assert!(!proof.verify(tree.root(), b"key2", Some(b"value2")));
+
+        // Test with string slices
+        assert!(proof.verify(tree.root(), "key1", Some("value1")));
     }
 
     #[test]
@@ -843,7 +886,10 @@ mod tests {
         tree.insert(b"key3", b"value3");
 
         let proof = tree.prove(b"key2");
-        assert!(proof.verify(tree.root(), b"key2", None));
+        assert!(proof.verify(tree.root(), b"key2", None::<&[u8]>));
+
+        // Test with string slice
+        assert!(proof.verify(tree.root(), "key2", None::<&[u8]>));
     }
 
     #[test]
@@ -857,7 +903,7 @@ mod tests {
         let proof = tree.prove_non_membership_with_range(b"key2");
         assert!(proof.verify(tree.root()));
 
-        let proof2 = tree.prove_non_membership_with_range(b"key0");
+        let proof2 = tree.prove_non_membership_with_range("key0"); // Using string slice
         assert!(proof2.verify(tree.root()));
 
         let proof3 = tree.prove_non_membership_with_range(b"key4");
@@ -872,14 +918,14 @@ mod tests {
 
         let items = [
             (b"key1", b"value1"),
-            (b"key2", b"value2"),
+            (b"key2", b"value2"), // Using string slices
             (b"key3", b"value3"),
         ];
 
         tree.batch_insert(&items);
         assert_eq!(tree.leaf_count(), 3);
 
-        let keys_to_remove = [b"key1", b"key3"];
+        let keys_to_remove = [b"key1", b"key3"]; // Mixed types
         let removed = tree.batch_remove(&keys_to_remove);
         assert_eq!(removed, 2);
         assert_eq!(tree.leaf_count(), 1);
@@ -929,12 +975,15 @@ mod tests {
 
         assert!(db.set_root(1, [1u8; 32]).is_ok());
         assert!(db.set_leaf(b"key1", [2u8; 32]).is_ok());
+        assert!(db.set_leaf("key2", [3u8; 32]).is_ok()); // Using string slice
 
         assert_eq!(db.get_root(1).unwrap(), Some([1u8; 32]));
         assert_eq!(db.get_leaf(b"key1").unwrap(), Some([2u8; 32]));
-        assert!(db.get_leaf(b"key2").unwrap().is_none());
+        assert_eq!(db.get_leaf("key2").unwrap(), Some([3u8; 32])); // Using string slice
+        assert!(db.get_leaf(b"key3").unwrap().is_none());
 
         assert!(db.delete_leaf(b"key1").unwrap());
+        assert!(db.delete_leaf("key2").unwrap()); // Using string slice
         assert!(!db.delete_leaf(b"key1").unwrap());
     }
 
@@ -947,6 +996,9 @@ mod tests {
 
         let proof = tree.prove(b"key1");
         assert!(proof.verify_enhanced(tree.root(), b"key1", Some(b"value1"), 1));
+
+        // Test with string slices
+        assert!(proof.verify_enhanced(tree.root(), "key1", Some("value1"), 1));
 
         // Test with wrong version
         assert!(!proof.verify_enhanced(tree.root(), b"key1", Some(b"value1"), 2));
@@ -962,7 +1014,10 @@ mod tests {
         assert_eq!(tree.leaf_count(), 0);
 
         let proof = tree.prove(b"key1");
-        assert!(proof.verify(tree.root(), b"key1", None));
+        assert!(proof.verify(tree.root(), b"key1", None::<&[u8]>));
+
+        // Test with string slice
+        assert!(proof.verify(tree.root(), "key1", None::<&[u8]>));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use core::marker::PhantomData;
 
 pub trait Hasher {
-    type Output: Copy + PartialEq + Default;
+    type Output: Copy + PartialEq + Default + AsRef<[u8]>;
 
     fn hash_leaf(data: &[u8]) -> Self::Output;
     fn hash_node(left: &Self::Output, right: &Self::Output) -> Self::Output;
@@ -112,5 +112,61 @@ impl<const HEIGHT: usize, H: Hasher> MerkleProof<HEIGHT, H> {
         }
 
         hash == root
+    }
+}
+// For bidirectional trees where deepest leaf is another tree's root
+pub struct BidirectionalMerkleTree<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher> {
+    main_tree: MerkleTree<HEIGHT, H>,
+    child_trees: [Option<Box<MerkleTree<HEIGHT, H>>>; MAX_CHILDREN],
+}
+
+impl<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher>
+    BidirectionalMerkleTree<HEIGHT, MAX_CHILDREN, H>
+{
+    pub fn new() -> Self {
+        Self {
+            main_tree: MerkleTree::new(),
+            child_trees: [const { None }; MAX_CHILDREN],
+        }
+    }
+    pub fn link_child_tree(&mut self, leaf_index: usize, child_tree: MerkleTree<HEIGHT, H>) {
+        // The deepest leaf becomes the root of the child tree
+        let child_root = child_tree.root();
+        self.main_tree
+            .update_leaf(leaf_index, &self.hash_to_bytes(child_root));
+        self.child_trees[leaf_index] = Some(Box::new(child_tree));
+    }
+
+    pub fn get_child_root(&self, leaf_index: usize) -> Option<H::Output> {
+        Some(self.child_trees.get(leaf_index)?.as_ref()?.root())
+    }
+
+    pub fn verify_bidirectional_path(
+        &self,
+        main_leaf_index: usize,
+        main_leaf_data: &[u8],
+        child_leaf_index: usize,
+        child_leaf_data: &[u8],
+    ) -> bool {
+        // Verify path in main tree
+        let main_proof = self.main_tree.prove(main_leaf_index);
+        if !main_proof.verify(main_leaf_data, self.main_tree.root()) {
+            return false;
+        }
+
+        // Verify the child tree exists and path within it
+        if let Some(child_tree) = &self.child_trees[main_leaf_index] {
+            let child_proof = child_tree.prove(child_leaf_index);
+            child_proof.verify(child_leaf_data, child_tree.root())
+        } else {
+            false
+        }
+    }
+
+    fn hash_to_bytes(&self, hash: H::Output) -> Vec<u8>
+    where
+        H::Output: AsRef<[u8]>,
+    {
+        hash.as_ref().to_vec()
     }
 }

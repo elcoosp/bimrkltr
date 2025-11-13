@@ -1,0 +1,7 @@
+[package]
+name = "bimrkltr"
+version = "0.1.0"
+edition = "2024"
+description="A high-performance, compile-time sized Merkle tree implementation for Rust, featuring bidirectional tree support and generic hash functions."
+
+[dependencies]

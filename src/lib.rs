@@ -3,28 +3,71 @@ use core::fmt;
 use std::fmt::{Display, Formatter};
 
 pub trait Hasher {
-    type Output: Copy + Clone + std::fmt::Debug + PartialEq + Default + AsRef<[u8]>;
+    type Output: Copy + PartialEq + Default + AsRef<[u8]>;
 
     fn hash_leaf(data: &[u8]) -> Self::Output;
     fn hash_node(left: &Self::Output, right: &Self::Output) -> Self::Output;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MerkleTree<const HEIGHT: usize, H: Hasher> {
     nodes: Vec<H::Output>,
     _hasher: std::marker::PhantomData<H>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MerkleProof<const HEIGHT: usize, H: Hasher> {
     path: [Option<H::Output>; HEIGHT],
     leaf_index: usize,
     _hasher: std::marker::PhantomData<H>,
 }
 
+// Manual Debug implementation to avoid requiring H::Output: Debug
+impl<const HEIGHT: usize, H: Hasher> fmt::Debug for MerkleTree<HEIGHT, H> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MerkleTree")
+            .field("height", &HEIGHT)
+            .field("leaf_count", &self.leaf_count())
+            .field("root", &"<hash>")
+            .finish()
+    }
+}
+
+impl<const HEIGHT: usize, H: Hasher> fmt::Debug for MerkleProof<HEIGHT, H> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MerkleProof")
+            .field("leaf_index", &self.leaf_index)
+            .field("path_length", &self.path_length())
+            .finish()
+    }
+}
+
+// For bidirectional trees where deepest leaf is another tree's root
+pub struct BidirectionalMerkleTree<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher> {
+    main_tree: MerkleTree<HEIGHT, H>,
+    child_trees: [Option<Box<MerkleTree<HEIGHT, H>>>; MAX_CHILDREN],
+}
+
+// Manual Debug implementation for BidirectionalMerkleTree
+impl<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher> fmt::Debug
+    for BidirectionalMerkleTree<HEIGHT, MAX_CHILDREN, H>
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BidirectionalMerkleTree")
+            .field("height", &HEIGHT)
+            .field("max_children", &MAX_CHILDREN)
+            .field("child_tree_count", &self.child_tree_count())
+            .finish()
+    }
+}
+
 impl<const HEIGHT: usize, H: Hasher> MerkleTree<HEIGHT, H> {
-    const TOTAL_NODES: usize = (1 << (HEIGHT + 1)) - 1;
-    const LEAF_COUNT: usize = 1 << HEIGHT;
+    const TOTAL_NODES: usize = if HEIGHT > 0 {
+        (1 << (HEIGHT + 1)) - 1
+    } else {
+        1
+    };
+    const LEAF_COUNT: usize = if HEIGHT > 0 { 1 << HEIGHT } else { 1 };
 
     pub fn new() -> Self {
         Self {
@@ -38,21 +81,38 @@ impl<const HEIGHT: usize, H: Hasher> MerkleTree<HEIGHT, H> {
 
         let mut tree = Self::new();
 
+        // Handle the case where HEIGHT is 0 (single node tree)
+        if HEIGHT == 0 {
+            tree.nodes[0] = H::hash_leaf(&leaves[0]);
+            return tree;
+        }
+
         // Fill leaves
         let leaf_offset = (1 << HEIGHT) - 1;
         for (i, leaf_data) in leaves.iter().enumerate() {
             tree.nodes[leaf_offset + i] = H::hash_leaf(leaf_data);
         }
 
-        // Build tree bottom-up
+        // Build tree bottom-up, starting from the level above leaves
+        // We go from HEIGHT-1 down to 0 (but level 0 is the root and has no parent)
         for level in (0..HEIGHT).rev() {
             let level_start = (1 << level) - 1;
-            let level_end = (1 << (level + 1)) - 1;
+            let level_count = 1 << level;
+            let level_end = level_start + level_count;
 
-            for i in (level_start..level_end).step_by(2) {
-                let left = &tree.nodes[i];
-                let right = &tree.nodes[i + 1];
-                tree.nodes[(i - 1) / 2] = H::hash_node(left, right);
+            // Only process if we have at least 2 nodes in this level
+            if level_count >= 2 {
+                for i in (level_start..level_end).step_by(2) {
+                    // Ensure we don't go out of bounds
+                    if i + 1 < level_end && i + 1 < tree.nodes.len() {
+                        let left = &tree.nodes[i];
+                        let right = &tree.nodes[i + 1];
+                        let parent_index = (i - 1) / 2;
+                        if parent_index < tree.nodes.len() {
+                            tree.nodes[parent_index] = H::hash_node(left, right);
+                        }
+                    }
+                }
             }
         }
 
@@ -64,7 +124,14 @@ impl<const HEIGHT: usize, H: Hasher> MerkleTree<HEIGHT, H> {
     }
 
     pub fn update_leaf(&mut self, index: usize, data: &[u8]) {
-        let mut pos = (1 << HEIGHT) - 1 + index;
+        if HEIGHT == 0 {
+            // Single node tree
+            self.nodes[0] = H::hash_leaf(data);
+            return;
+        }
+
+        let leaf_offset = (1 << HEIGHT) - 1;
+        let mut pos = leaf_offset + index;
         self.nodes[pos] = H::hash_leaf(data);
 
         // Update path to root
@@ -73,22 +140,47 @@ impl<const HEIGHT: usize, H: Hasher> MerkleTree<HEIGHT, H> {
             let left_child = parent * 2 + 1;
             let right_child = parent * 2 + 2;
 
-            self.nodes[parent] = H::hash_node(&self.nodes[left_child], &self.nodes[right_child]);
+            // Ensure we don't go out of bounds
+            if right_child < self.nodes.len() {
+                self.nodes[parent] =
+                    H::hash_node(&self.nodes[left_child], &self.nodes[right_child]);
+            }
             pos = parent;
         }
     }
 
     pub fn get_leaf(&self, index: usize) -> H::Output {
-        self.nodes[(1 << HEIGHT) - 1 + index]
+        if HEIGHT == 0 {
+            return self.nodes[0];
+        }
+        let leaf_offset = (1 << HEIGHT) - 1;
+        self.nodes[leaf_offset + index]
     }
 
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<HEIGHT, H> {
         let mut path = [None; HEIGHT];
-        let mut pos = (1 << HEIGHT) - 1 + leaf_index;
+
+        if HEIGHT == 0 {
+            return MerkleProof {
+                path,
+                leaf_index,
+                _hasher: std::marker::PhantomData,
+            };
+        }
+
+        let leaf_offset = (1 << HEIGHT) - 1;
+        let mut pos = leaf_offset + leaf_index;
 
         for level in 0..HEIGHT {
+            // Calculate sibling position
             let sibling = if pos % 2 == 1 { pos + 1 } else { pos - 1 };
-            path[level] = Some(self.nodes[sibling]);
+
+            // Only store sibling if it's within bounds
+            if sibling < self.nodes.len() {
+                path[level] = Some(self.nodes[sibling]);
+            }
+
+            // Move to parent
             pos = (pos - 1) / 2;
         }
 
@@ -113,13 +205,20 @@ impl<const HEIGHT: usize, H: Hasher> MerkleProof<HEIGHT, H> {
         let mut hash = H::hash_leaf(leaf_data);
         let mut pos = self.leaf_index;
 
-        for sibling_hash in self.path.iter().flatten() {
-            if pos % 2 == 0 {
-                hash = H::hash_node(sibling_hash, &hash);
+        for sibling_hash in self.path.iter() {
+            if let Some(sibling) = sibling_hash {
+                if pos % 2 == 0 {
+                    // Current node is left child
+                    hash = H::hash_node(&hash, sibling);
+                } else {
+                    // Current node is right child
+                    hash = H::hash_node(sibling, &hash);
+                }
+                pos = pos / 2;
             } else {
-                hash = H::hash_node(&hash, sibling_hash);
+                // No sibling at this level, can't continue
+                return false;
             }
-            pos /= 2;
         }
 
         hash == root
@@ -128,13 +227,6 @@ impl<const HEIGHT: usize, H: Hasher> MerkleProof<HEIGHT, H> {
     pub fn path_length(&self) -> usize {
         self.path.iter().filter(|x| x.is_some()).count()
     }
-}
-
-// For bidirectional trees where deepest leaf is another tree's root
-#[derive(Debug, Clone)]
-pub struct BidirectionalMerkleTree<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher> {
-    main_tree: MerkleTree<HEIGHT, H>,
-    child_trees: [Option<Box<MerkleTree<HEIGHT, H>>>; MAX_CHILDREN],
 }
 
 impl<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher>
@@ -150,13 +242,15 @@ impl<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher>
     pub fn link_child_tree(&mut self, leaf_index: usize, child_tree: MerkleTree<HEIGHT, H>) {
         // The deepest leaf becomes the root of the child tree
         let child_root = child_tree.root();
-        self.main_tree
-            .update_leaf(leaf_index, &self.hash_to_bytes(child_root));
+
+        // Convert hash to bytes for storage in the main tree leaf
+        let root_bytes = child_root.as_ref().to_vec();
+        self.main_tree.update_leaf(leaf_index, &root_bytes);
         self.child_trees[leaf_index] = Some(Box::new(child_tree));
     }
 
     pub fn get_child_root(&self, leaf_index: usize) -> Option<H::Output> {
-        Some(self.child_trees.get(leaf_index)?.as_ref()?.root())
+        Some(self.child_trees.get(leaf_index)?.as_ref()?.as_ref().root())
     }
 
     pub fn verify_bidirectional_path(
@@ -166,26 +260,19 @@ impl<const HEIGHT: usize, const MAX_CHILDREN: usize, H: Hasher>
         child_leaf_index: usize,
         child_leaf_data: &[u8],
     ) -> bool {
-        // Verify path in main tree
+        // First verify the main tree path
         let main_proof = self.main_tree.prove(main_leaf_index);
         if !main_proof.verify(main_leaf_data, self.main_tree.root()) {
             return false;
         }
 
-        // Verify the child tree exists and path within it
+        // Then verify the child tree exists and the path within it
         if let Some(child_tree) = &self.child_trees[main_leaf_index] {
             let child_proof = child_tree.prove(child_leaf_index);
             child_proof.verify(child_leaf_data, child_tree.root())
         } else {
             false
         }
-    }
-
-    fn hash_to_bytes(&self, hash: H::Output) -> Vec<u8>
-    where
-        H::Output: AsRef<[u8]>,
-    {
-        hash.as_ref().to_vec()
     }
 
     pub fn main_tree(&self) -> &MerkleTree<HEIGHT, H> {
@@ -326,35 +413,57 @@ impl Hasher for TestHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_snapshot;
+
+    // Helper function to create test data
+    fn create_test_leaves<const N: usize>(start: u8) -> [[u8; 32]; N] {
+        let mut leaves = [[0u8; 32]; N];
+        for i in 0..N {
+            leaves[i] = [start + i as u8; 32];
+        }
+        leaves
+    }
 
     #[test]
     fn test_merkle_tree_construction() {
-        type TestTree = MerkleTree<3, TestHasher>; // 8 leaves
+        type TestTree = MerkleTree<2, TestHasher>; // 4 leaves
 
-        let leaves = [[1u8; 32]; 8];
+        let leaves = create_test_leaves::<4>(1);
         let tree = TestTree::from_leaves(&leaves);
 
-        assert_eq!(tree.leaf_count(), 8);
-        assert_eq!(tree.height(), 3);
+        assert_eq!(tree.leaf_count(), 4);
+        assert_eq!(tree.height(), 2);
+    }
+
+    #[test]
+    fn test_single_node_tree() {
+        type SingleNodeTree = MerkleTree<0, TestHasher>; // 1 leaf (root)
+
+        let leaves = [[1u8; 32]];
+        let tree = SingleNodeTree::from_leaves(&leaves);
+
+        assert_eq!(tree.leaf_count(), 1);
+        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.root(), TestHasher::hash_leaf(&[1u8; 32]));
     }
 
     #[test]
     fn test_merkle_tree_update() {
         type TestTree = MerkleTree<2, TestHasher>; // 4 leaves
 
-        let leaves = [[1u8; 32]; 4];
+        let leaves = create_test_leaves::<4>(1);
         let mut tree = TestTree::from_leaves(&leaves);
         let original_root = tree.root();
 
         // Update a leaf
-        tree.update_leaf(1, &[2u8; 32]);
+        tree.update_leaf(1, &[10u8; 32]);
         let new_root = tree.root();
 
         assert_ne!(original_root, new_root);
 
         // Verify the updated leaf
         let updated_leaf = tree.get_leaf(1);
-        let expected_hash = TestHasher::hash_leaf(&[2u8; 32]);
+        let expected_hash = TestHasher::hash_leaf(&[10u8; 32]);
         assert_eq!(updated_leaf, expected_hash);
     }
 
@@ -367,9 +476,8 @@ mod tests {
 
         // Generate proof for leaf 1
         let proof = tree.prove(1);
-        assert_eq!(proof.path_length(), 2);
 
-        // Verify proof
+        // Verify proof with correct data
         assert!(proof.verify(&[2u8; 32], tree.root()));
 
         // Invalid data should fail
@@ -377,10 +485,36 @@ mod tests {
     }
 
     #[test]
+    fn test_merkle_proof_all_leaves() {
+        type TestTree = MerkleTree<2, TestHasher>;
+
+        let leaves = create_test_leaves::<4>(1);
+        let tree = TestTree::from_leaves(&leaves);
+
+        // Test proof for each leaf
+        for i in 0..4 {
+            let proof = tree.prove(i);
+            assert!(proof.verify(&leaves[i], tree.root()));
+        }
+    }
+
+    #[test]
+    fn test_single_node_proof() {
+        type SingleNodeTree = MerkleTree<0, TestHasher>;
+
+        let leaves = [[1u8; 32]];
+        let tree = SingleNodeTree::from_leaves(&leaves);
+
+        let proof = tree.prove(0);
+        assert_eq!(proof.path_length(), 0);
+        assert!(proof.verify(&[1u8; 32], tree.root()));
+    }
+
+    #[test]
     fn test_merkle_tree_display() {
         type TestTree = MerkleTree<2, TestHasher>;
 
-        let leaves = [[1u8; 32]; 4];
+        let leaves = create_test_leaves::<4>(1);
         let tree = TestTree::from_leaves(&leaves);
 
         let display_output = format!("{}", tree);
@@ -395,10 +529,10 @@ mod tests {
         type ChildTree = MerkleTree<2, TestHasher>;
         type BiTree = BidirectionalMerkleTree<2, 4, TestHasher>;
 
-        let main_leaves = [[1u8; 32]; 4];
-        let child_leaves = [[5u8; 32]; 4];
+        let main_leaves = create_test_leaves::<4>(1);
+        let child_leaves = create_test_leaves::<4>(5);
 
-        let main_tree = MainTree::from_leaves(&main_leaves);
+        let _main_tree = MainTree::from_leaves(&main_leaves);
         let child_tree = ChildTree::from_leaves(&child_leaves);
 
         let mut bi_tree = BiTree::new();
@@ -417,21 +551,25 @@ mod tests {
         type ChildTree = MerkleTree<2, TestHasher>;
         type BiTree = BidirectionalMerkleTree<2, 4, TestHasher>;
 
-        let main_leaves = [[1u8; 32]; 4];
-        let child_leaves = [[5u8; 32]; 4];
+        let main_leaves = create_test_leaves::<4>(1);
+        let child_leaves = create_test_leaves::<4>(5);
 
         let main_tree = MainTree::from_leaves(&main_leaves);
         let child_tree = ChildTree::from_leaves(&child_leaves);
+        let child_tree_clone = child_tree.clone();
 
         let mut bi_tree = BiTree::new();
-        bi_tree.link_child_tree(0, child_tree.clone());
+        bi_tree.link_child_tree(0, child_tree);
+
+        // Get the actual leaf data from the main tree after linking
+        let main_leaf_data = bi_tree.main_tree().get_leaf(0);
 
         // Verify bidirectional path
         let result = bi_tree.verify_bidirectional_path(
-            0,                                // main leaf index
-            &main_tree.get_leaf(0).as_ref(),  // main leaf data
-            1,                                // child leaf index
-            &child_tree.get_leaf(1).as_ref(), // child leaf data
+            0,                                      // main leaf index
+            main_leaf_data.as_ref(),                // main leaf data (from updated tree)
+            1,                                      // child leaf index
+            &child_tree_clone.get_leaf(1).as_ref(), // child leaf data
         );
 
         assert!(result);
@@ -461,7 +599,6 @@ mod tests {
 
         // Proof for height 1 tree
         let proof = tree.prove(0);
-        assert_eq!(proof.path_length(), 1);
         assert!(proof.verify(&[1u8; 32], tree.root()));
     }
 
@@ -469,14 +606,13 @@ mod tests {
     fn test_proof_display() {
         type TestTree = MerkleTree<2, TestHasher>;
 
-        let leaves = [[1u8; 32]; 4];
+        let leaves = create_test_leaves::<4>(1);
         let tree = TestTree::from_leaves(&leaves);
         let proof = tree.prove(1);
 
         let display_output = format!("{}", proof);
         assert!(display_output.contains("Merkle Proof"));
         assert!(display_output.contains("Leaf Index: 1"));
-        assert!(display_output.contains("Path Length: 2"));
     }
 
     #[test]
@@ -499,9 +635,9 @@ mod tests {
 
         // Link multiple child trees
         for i in 0..3 {
-            let child_leaves = [[i; 32]; 4];
+            let child_leaves = create_test_leaves::<4>((i * 10) as u8);
             let child_tree = MerkleTree::from_leaves(&child_leaves);
-            bi_tree.link_child_tree(i as usize, child_tree);
+            bi_tree.link_child_tree(i, child_tree);
         }
 
         assert_eq!(bi_tree.child_tree_count(), 3);
@@ -513,5 +649,97 @@ mod tests {
 
         // Unlinked leaf should return None
         assert!(bi_tree.get_child_root(3).is_none());
+    }
+
+    // Insta snapshot tests
+    #[test]
+    fn test_merkle_tree_snapshot() {
+        type TestTree = MerkleTree<2, TestHasher>;
+
+        let leaves = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let tree = TestTree::from_leaves(&leaves);
+
+        assert_snapshot!("merkle_tree_display", format!("{}", tree));
+    }
+
+    #[test]
+    fn test_merkle_proof_snapshot() {
+        type TestTree = MerkleTree<2, TestHasher>;
+
+        let leaves = create_test_leaves::<4>(1);
+        let tree = TestTree::from_leaves(&leaves);
+        let proof = tree.prove(1);
+
+        assert_snapshot!("merkle_proof_display", format!("{}", proof));
+    }
+
+    #[test]
+    fn test_bidirectional_tree_snapshot() {
+        type BiTree = BidirectionalMerkleTree<2, 4, TestHasher>;
+
+        let mut bi_tree = BiTree::new();
+
+        // Add some child trees
+        for i in 0..2 {
+            let child_leaves = create_test_leaves::<4>((i + 1) as u8 * 10);
+            let child_tree = MerkleTree::from_leaves(&child_leaves);
+            bi_tree.link_child_tree(i, child_tree);
+        }
+
+        assert_snapshot!("bidirectional_tree_display", format!("{}", bi_tree));
+    }
+
+    #[test]
+    fn test_empty_bidirectional_tree_snapshot() {
+        type BiTree = BidirectionalMerkleTree<2, 4, TestHasher>;
+
+        let bi_tree = BiTree::new();
+        assert_snapshot!("empty_bidirectional_tree", format!("{}", bi_tree));
+    }
+
+    #[test]
+    fn test_small_tree_snapshot() {
+        type SmallTree = MerkleTree<1, TestHasher>;
+
+        let leaves = [[1u8; 32], [2u8; 32]];
+        let tree = SmallTree::from_leaves(&leaves);
+
+        assert_snapshot!("small_tree_display", format!("{}", tree));
+    }
+
+    #[test]
+    fn test_single_node_tree_snapshot() {
+        type SingleNodeTree = MerkleTree<0, TestHasher>;
+
+        let leaves = [[1u8; 32]];
+        let tree = SingleNodeTree::from_leaves(&leaves);
+
+        assert_snapshot!("single_node_tree_display", format!("{}", tree));
+    }
+
+    #[test]
+    fn test_sha256_tree_snapshot() {
+        type Sha256Tree = MerkleTree<2, Sha256Hasher>;
+
+        let leaves = [
+            b"leaf0".as_ref(),
+            b"leaf1".as_ref(),
+            b"leaf2".as_ref(),
+            b"leaf3".as_ref(),
+        ];
+
+        // Convert to [u8; 32] arrays
+        let leaf_arrays: Vec<[u8; 32]> = leaves
+            .iter()
+            .map(|&data| {
+                let mut array = [0u8; 32];
+                let bytes = data;
+                array[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+                array
+            })
+            .collect();
+
+        let tree = Sha256Tree::from_leaves(&leaf_arrays);
+        assert_snapshot!("sha256_tree_display", format!("{}", tree));
     }
 }

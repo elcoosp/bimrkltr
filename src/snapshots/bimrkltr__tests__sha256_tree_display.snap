@@ -1,0 +1,12 @@
+---
+source: src/lib.rs
+expression: "format!(\"{}\", tree)"
+---
+🌳 Merkle Tree (height: 2)
+├── Root: 625527f217fa2b23eb296d7b108420f7f210473301a43eddfb24b00b6785b61a
+├── Leaves: 4
+├── Total Nodes: 7
+└── First 3 leaves:
+    0: 2d6d05feb1d893ccbb69c317eb46ce730c76c85b7f0637c45f7c6482eda5355a
+    1: e0b03933d0ee4477834f8f16cd1b3db7d59ac262930aadecad1ff345449eb020
+    2: 8a31004d86f8604f071eed85d8b9e238a778fd990ee006dd20a087482223101c

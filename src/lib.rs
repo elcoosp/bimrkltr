@@ -1,4 +1,4 @@
-// src/lib.rs
+pub mod jmt;
 use core::fmt;
 use std::fmt::{Display, Formatter};
 

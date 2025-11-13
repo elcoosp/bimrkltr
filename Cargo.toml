@@ -7,6 +7,7 @@ description="A high-performance, compile-time sized Merkle tree implementation f
 [dependencies]
 sha2 = "0.10.9"
 hex = "0.4.3"
+serde= {version="1", features=["derive"]}
 [dev-dependencies]
 insta = { version = "1.43.2", features = ["yaml"] }
 [profile.dev.package]

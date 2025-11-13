@@ -1,7 +1,7 @@
 # bimrkltr
 
-[![Crates.io](https://img.shields.io/crates/v/merkle-tree-const.svg)](https://crates.io/crates/merkle-tree-const)
-[![Docs.rs](https://docs.rs/merkle-tree-const/badge.svg)](https://docs.rs/merkle-tree-const)
+[![Crates.io](https://img.shields.io/crates/v/bimrkltr.svg)](https://crates.io/crates/bimrkltr)
+[![Docs.rs](https://docs.rs/bimrkltr/badge.svg)](https://docs.rs/bimrkltr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70+-blue.svg)](https://www.rust-lang.org)
 
@@ -21,13 +21,13 @@ A high-performance, compile-time sized Merkle tree implementation for Rust, feat
 
 ```toml
 [dependencies]
-merkle-tree-const = "0.1"
+bimrkltr = "0.1"
 ```
 
 ### Basic Usage
 
 ```rust
-use merkle_tree_const::{MerkleTree, Hasher};
+use bimrkltr::{MerkleTree, Hasher};
 
 // You need to implement your own Hasher - here's a simple example
 pub struct SimpleHasher;
@@ -71,7 +71,7 @@ assert!(proof.verify(&[0u8; 32], root));
 ### Creating a Simple Tree
 
 ```rust
-use merkle_tree_const::{MerkleTree, Hasher};
+use bimrkltr::{MerkleTree, Hasher};
 
 pub struct MyHasher;
 impl Hasher for MyHasher {
@@ -99,7 +99,7 @@ println!("Root: {:?}", tree.root());
 ### Bidirectional Trees
 
 ```rust
-use merkle_tree_const::{MerkleTree, BidirectionalMerkleTree, Hasher};
+use bimrkltr::{MerkleTree, BidirectionalMerkleTree, Hasher};
 
 pub struct MyHasher;
 impl Hasher for MyHasher {
@@ -147,7 +147,7 @@ assert!(bi_tree.verify_bidirectional_path(
 ### Custom Hash Function
 
 ```rust
-use merkle_tree_const::{MerkleTree, Hasher};
+use bimrkltr::{MerkleTree, Hasher};
 use sha3::{Keccak256, Digest};
 
 pub struct KeccakHasher;

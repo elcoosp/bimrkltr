@@ -1,0 +1,8 @@
+---
+source: src/lib.rs
+expression: "tree.prove(b\"key\").to_string()"
+---
+🔐 JMT Proof
+├── Leaf Key: 6b6579
+├── Leaf Hash: 074bf7f7156ee21ca3828111f54f98d7da5047eff55fd1002b04454c4383201c
+└── Siblings: 0 of 0 levels

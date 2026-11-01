@@ -1,681 +1,800 @@
-// src/lib.rs
-use core::fmt;
+//! Sparse binary Merkle trees ("jellyfish"-style): a [`JellyfishMerkleTree`]
+//! committing to an arbitrary key set, with membership and non-membership
+//! proofs, versioned storage and a pluggable database trait.
+//!
+//! # How it works
+//!
+//! Every key is mapped to a fixed-size *position* via
+//! [`Hasher::commit_key`] and the tree is the canonical sparse binary trie
+//! over those bit strings:
+//!
+//! - a subtree with exactly one leaf hashes to that leaf hash,
+//! - a subtree with several leaves hashes to
+//!   [`Hasher::hash_internal_node`] over the recursively computed child
+//!   subtree hashes (left child first),
+//! - an empty tree hashes to [`Hasher::empty_hash`].
+//!
+//! A proof lists, for every level from the leaf to the root, the sibling
+//! subtree hash when the queried node has one ([`Some`]) or [`None`] when
+//! the node was promoted as an only child. Verification replays exactly the
+//! same fold, so honestly generated proofs always verify, and forging one
+//! requires a hash preimage.
+//!
+//! The same proof type covers membership (proof of a leaf equal to the
+//! queried key) and non-membership (proof of a *different* leaf whose
+//! position shadows the queried key); [`JMTProof::verify`] distinguishes
+//! the two through the `value` argument.
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
+use core::fmt::{self, Display, Formatter};
+
+use core::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt::{Display, Formatter};
 
-pub trait Hasher: Sized {
-    type Output: Copy
-        + Clone
-        + std::fmt::Debug
-        + PartialEq
-        + Default
-        + AsRef<[u8]>
-        + Serialize
-        + for<'de> Deserialize<'de>;
+use crate::error::JMTError;
+use crate::hasher::Hasher;
 
-    fn hash_leaf(data: &[u8]) -> Self::Output;
-    fn hash_node(left: &Self::Output, right: &Self::Output) -> Self::Output;
-
-    // JMT optimizations
-    fn empty_hash() -> Self::Output;
-    fn hash_leaf_with_key(key: &[u8], data: &[u8]) -> Self::Output;
-    fn hash_internal_node(children: &[Self::Output]) -> Self::Output;
-    fn hash_with_version(version: u64, data: &[u8]) -> Self::Output;
-    fn commit_key(key: &[u8]) -> Self::Output;
+/// Is bit `j` (0 = most significant) of `position` set?
+fn bit_msb(position: &[u8], j: usize) -> bool {
+    (position[j / 8] >> (7 - j % 8)) & 1 == 1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JellyfishMerkleTree<const HEIGHT: usize, H: Hasher> {
+/// Do `a` and `b` share their first `bits` bits?
+///
+/// Both slices must have the same length; `bits` must not exceed
+/// `a.len() * 8`.
+fn prefix_eq(a: &[u8], b: &[u8], bits: usize) -> bool {
+    let full = bits / 8;
+    if a[..full] != b[..full] {
+        return false;
+    }
+    let rem = bits % 8;
+    if rem == 0 {
+        return true;
+    }
+    let mask = 0xFF_u8 << (8 - rem);
+    (a[full] & mask) == (b[full] & mask)
+}
+
+/// Number of leading bits `a` and `b` have in common.
+fn lcp_bits(a: &[u8], b: &[u8]) -> usize {
+    let mut count = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x == y {
+            count += 8;
+        } else {
+            count += (x ^ y).leading_zeros() as usize;
+            break;
+        }
+    }
+    count
+}
+
+/// A sparse Merkle tree committing to an arbitrary set of byte-string keys.
+///
+/// Unlike [`MerkleTree`](crate::MerkleTree) the tree is not complete: its
+/// depth is fixed at `8 * commit_key_len` bits, but only the branches
+/// leading to existing leaves exist. The tree maps keys to *leaf hashes*
+/// (`hash_leaf_with_key(key, data)`); the underlying values live in
+/// userland and are only ever committed to.
+///
+/// Every mutating operation refreshes the root; batch variants recompute it
+/// once for the whole batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JellyfishMerkleTree<H: Hasher> {
+    /// Cached root hash, refreshed after every mutation.
     root: H::Output,
-    leaves: BTreeMap<Vec<u8>, H::Output>,
+    /// Version tag carried by the tree (managed by the user or by
+    /// [`VersionedJMTStorage`]).
     version: u64,
-    _hasher: std::marker::PhantomData<H>,
-    node_cache: HashMap<Vec<u8>, H::Output>,
-    cache_limit: usize,
+    /// Position (full key commitment) → (original key, leaf hash).
+    leaves: BTreeMap<Vec<u8>, (Vec<u8>, H::Output)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JMTProof<H: Hasher> {
-    leaf: Option<(Vec<u8>, H::Output)>,
-    siblings: Vec<H::Output>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JMTNonMembershipProof<H: Hasher> {
-    key: Vec<u8>,
-    predecessor: Option<(Vec<u8>, H::Output)>,
-    successor: Option<(Vec<u8>, H::Output)>,
-    root: H::Output,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JMTDelta<H: Hasher> {
-    pub inserted: BTreeMap<Vec<u8>, H::Output>,
-    pub deleted: BTreeSet<Vec<u8>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VersionedJMTStorage<H: Hasher> {
-    trees: BTreeMap<u64, H::Output>,
-    deltas: BTreeMap<u64, JMTDelta<H>>,
-    current_version: u64,
-    _hasher: std::marker::PhantomData<H>,
-}
-
-// Error types
-#[derive(Debug, Clone)]
-pub enum JMTError {
-    KeyNotFound(Vec<u8>),
-    InvalidVersion(u64),
-    InvalidProof,
-    TreeFull,
-    InvalidKey,
-    SerializationError,
-}
-
-impl std::fmt::Display for JMTError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JMTError::KeyNotFound(key) => write!(f, "Key not found: {:?}", key),
-            JMTError::InvalidVersion(version) => write!(f, "Invalid version: {}", version),
-            JMTError::InvalidProof => write!(f, "Invalid proof"),
-            JMTError::TreeFull => write!(f, "Tree is full"),
-            JMTError::InvalidKey => write!(f, "Invalid key"),
-            JMTError::SerializationError => write!(f, "Serialization error"),
-        }
-    }
-}
-
-impl std::error::Error for JMTError {}
-
-// Implementation for JellyfishMerkleTree
-impl<const HEIGHT: usize, H: Hasher> JellyfishMerkleTree<HEIGHT, H> {
+impl<H: Hasher> JellyfishMerkleTree<H> {
+    /// Create an empty tree tagged with `version`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hasher output is empty (the tree would have no depth).
+    #[must_use]
     pub fn new(version: u64) -> Self {
+        assert!(
+            !H::Output::default().as_ref().is_empty(),
+            "hasher output must not be empty"
+        );
         Self {
             root: H::empty_hash(),
-            leaves: BTreeMap::new(),
             version,
-            _hasher: std::marker::PhantomData,
-            node_cache: HashMap::new(),
-            cache_limit: 1000,
+            leaves: BTreeMap::new(),
         }
     }
 
-    pub fn with_cache_limit(version: u64, cache_limit: usize) -> Self {
-        Self {
-            root: H::empty_hash(),
-            leaves: BTreeMap::new(),
-            version,
-            _hasher: std::marker::PhantomData,
-            node_cache: HashMap::new(),
-            cache_limit,
-        }
-    }
-
-    pub fn from_leaves<K, V>(version: u64, leaves: &[(K, V)]) -> Self
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
+    /// Create a tree from key/value pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::KeyCollision`] if two distinct keys commit to the
+    /// same position; in that case nothing is inserted.
+    pub fn from_leaves<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        version: u64,
+        items: &[(K, V)],
+    ) -> Result<Self, JMTError> {
         let mut tree = Self::new(version);
-        tree.batch_insert(leaves);
-        tree
+        tree.batch_insert(items)?;
+        Ok(tree)
     }
 
-    pub fn insert<K, V>(&mut self, key: K, data: V)
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key_ref = key.as_ref();
-        let data_ref = data.as_ref();
-        let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
-        self.leaves.insert(key_ref.to_vec(), value_hash);
-        self.update_root();
-    }
-
-    pub fn batch_insert<K, V>(&mut self, items: &[(K, V)])
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        for (key, data) in items {
-            let key_ref = key.as_ref();
-            let data_ref = data.as_ref();
-            let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
-            self.leaves.insert(key_ref.to_vec(), value_hash);
-        }
-        self.update_root();
-    }
-
-    pub fn update<K, V>(&mut self, key: K, data: V) -> Result<(), JMTError>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key_ref = key.as_ref();
-        let key_vec = key_ref.to_vec();
-        if self.leaves.contains_key(&key_vec) {
-            let data_ref = data.as_ref();
-            let value_hash = H::hash_leaf_with_key(key_ref, data_ref);
-            self.leaves.insert(key_vec, value_hash);
-            self.update_root();
-            Ok(())
-        } else {
-            Err(JMTError::KeyNotFound(key_ref.to_vec()))
-        }
-    }
-
-    pub fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> bool {
-        let key_vec = key.as_ref().to_vec();
-        if self.leaves.remove(&key_vec).is_some() {
-            self.update_root();
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn batch_remove<K>(&mut self, keys: &[K]) -> usize
-    where
-        K: AsRef<[u8]>,
-    {
-        let mut removed_count = 0;
-        for key in keys {
-            let key_vec = key.as_ref().to_vec();
-            if self.leaves.remove(&key_vec).is_some() {
-                removed_count += 1;
+    /// Insert (or replace) `key` with `data` and refresh the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::KeyCollision`] if a *different* key is already
+    /// committed to the same position.
+    pub fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        data: V,
+    ) -> Result<(), JMTError> {
+        let key = key.as_ref();
+        let commitment = H::commit_key(key);
+        let hash = H::hash_leaf_with_key(key, data.as_ref());
+        if let Some((existing, _)) = self.leaves.get(commitment.as_ref()) {
+            if existing.as_slice() != key {
+                return Err(JMTError::KeyCollision(existing.clone()));
             }
         }
-
-        if removed_count > 0 {
-            self.update_root();
-        }
-
-        removed_count
+        self.leaves
+            .insert(commitment.as_ref().to_vec(), (key.to_vec(), hash));
+        self.root = self.collapse(None).0;
+        Ok(())
     }
 
+    /// Replace the data of an existing `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::KeyNotFound`] if the key is absent and
+    /// [`JMTError::KeyCollision`] on commitment collision.
+    pub fn update<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        data: V,
+    ) -> Result<(), JMTError> {
+        if !self.contains(key.as_ref()) {
+            return Err(JMTError::KeyNotFound(key.as_ref().to_vec()));
+        }
+        self.insert(key, data)
+    }
+
+    /// Insert a batch atomically and refresh the root once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::KeyCollision`] if any pair of distinct keys (or
+    /// any key and an existing entry) commits to the same position; in that
+    /// case nothing is inserted.
+    pub fn batch_insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        items: &[(K, V)],
+    ) -> Result<(), JMTError> {
+        let mut staged: Vec<(Vec<u8>, Vec<u8>, H::Output)> = Vec::with_capacity(items.len());
+        for (key, data) in items {
+            let key = key.as_ref();
+            let commitment = H::commit_key(key);
+            let position = commitment.as_ref();
+            if let Some((existing, _)) = self.leaves.get(position) {
+                if existing.as_slice() != key {
+                    return Err(JMTError::KeyCollision(existing.clone()));
+                }
+            }
+            if let Some((_, existing_key, _)) = staged
+                .iter()
+                .find(|(staged_position, _, _)| staged_position.as_slice() == position)
+            {
+                if existing_key.as_slice() != key {
+                    return Err(JMTError::KeyCollision(existing_key.clone()));
+                }
+            }
+            let hash = H::hash_leaf_with_key(key, data.as_ref());
+            staged.push((position.to_vec(), key.to_vec(), hash));
+        }
+        for (position, key, hash) in staged {
+            self.leaves.insert(position, (key, hash));
+        }
+        self.root = self.collapse(None).0;
+        Ok(())
+    }
+
+    /// Remove `key`; returns whether it was present.
+    pub fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> bool {
+        self.batch_remove(core::slice::from_ref(&key)) == 1
+    }
+
+    /// Remove several keys and refresh the root at most once; returns how
+    /// many keys were actually removed.
+    pub fn batch_remove<K: AsRef<[u8]>>(&mut self, keys: &[K]) -> usize {
+        let mut removed = 0;
+        for key in keys {
+            let commitment = H::commit_key(key.as_ref());
+            if self.leaves.remove(commitment.as_ref()).is_some() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.root = self.collapse(None).0;
+        }
+        removed
+    }
+
+    /// Leaf hash committed for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::KeyNotFound`] if the key is absent.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<H::Output, JMTError> {
-        let key_vec = key.as_ref().to_vec();
+        let commitment = H::commit_key(key.as_ref());
         self.leaves
-            .get(&key_vec)
-            .copied()
+            .get(commitment.as_ref())
+            .map(|(_, hash)| *hash)
             .ok_or_else(|| JMTError::KeyNotFound(key.as_ref().to_vec()))
     }
 
+    /// Whether `key` is committed in the tree.
+    #[must_use]
     pub fn contains<K: AsRef<[u8]>>(&self, key: K) -> bool {
-        let key_vec = key.as_ref().to_vec();
-        self.leaves.contains_key(&key_vec)
+        let commitment = H::commit_key(key.as_ref());
+        self.leaves.contains_key(commitment.as_ref())
     }
 
-    fn update_root(&mut self) {
-        if self.leaves.is_empty() {
-            self.root = H::empty_hash();
-            return;
-        }
-
-        let mut current_level: Vec<(Vec<u8>, H::Output)> =
-            self.leaves.iter().map(|(k, v)| (k.clone(), *v)).collect();
-
-        let mut level = 0;
-        while current_level.len() > 1 {
-            let mut next_level = Vec::new();
-            let mut i = 0;
-
-            while i < current_level.len() {
-                if i + 1 < current_level.len() {
-                    let (left_key, left_hash) = &current_level[i];
-                    let (right_key, right_hash) = &current_level[i + 1];
-
-                    let common_prefix = self.common_prefix_length(left_key, right_key, level);
-
-                    if common_prefix > level {
-                        let parent_hash = H::hash_internal_node(&[*left_hash, *right_hash]);
-                        let parent_key = left_key[..common_prefix].to_vec();
-                        next_level.push((parent_key, parent_hash));
-                        i += 2;
-                    } else {
-                        next_level.push(current_level[i].clone());
-                        i += 1;
-                    }
-                } else {
-                    next_level.push(current_level[i].clone());
-                    i += 1;
-                }
-            }
-
-            current_level = next_level;
-            level += 1;
-        }
-
-        self.root = current_level[0].1;
-        self.clear_cache();
+    /// Iterate over the original keys, ordered by tree position.
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.leaves.values().map(|(key, _)| key.as_slice())
     }
 
-    fn common_prefix_length(&self, key1: &[u8], key2: &[u8], level: usize) -> usize {
-        let max_len = key1.len().min(key2.len());
-        for i in level..max_len {
-            if key1[i] != key2[i] {
-                return i;
-            }
-        }
-        max_len
-    }
-
-    pub fn prove<K: AsRef<[u8]>>(&self, key: K) -> JMTProof<H> {
-        let key_slice = key.as_ref();
-        let key_vec = key_slice.to_vec();
-        let leaf_data = self.leaves.get(&key_vec).copied();
-        let mut siblings = Vec::new();
-
-        if let Some(_value_hash) = leaf_data {
-            // Inclusion proof
-            let current_key = key_slice;
-            let mut remaining_leaves: Vec<(&Vec<u8>, &H::Output)> = self
-                .leaves
-                .iter()
-                .filter(|(k, _)| k.as_slice() != key_slice)
-                .collect();
-
-            let mut level = 0;
-            while !remaining_leaves.is_empty() {
-                if let Some(sibling) = self.find_sibling(current_key, &remaining_leaves, level) {
-                    siblings.push(*sibling.1);
-                    remaining_leaves.retain(|(k, _)| k != &sibling.0);
-                } else {
-                    siblings.push(H::empty_hash());
-                }
-                level += 1;
-            }
-        } else {
-            // Exclusion proof
-            if let Some((closest_key, closest_hash)) = self.find_closest_leaf(key_slice) {
-                siblings = self.generate_exclusion_proof(key_slice, closest_key, *closest_hash);
-            }
-        }
-
-        JMTProof {
-            leaf: leaf_data.map(|hash| (key_slice.to_vec(), hash)),
-            siblings,
-        }
-    }
-
-    pub fn prove_non_membership_with_range<K: AsRef<[u8]>>(
-        &self,
-        key: K,
-    ) -> JMTNonMembershipProof<H> {
-        let key_slice = key.as_ref();
-        let (predecessor, successor) = self.find_adjacent_leaves(key_slice);
-
-        JMTNonMembershipProof {
-            key: key_slice.to_vec(),
-            predecessor: predecessor.map(|(k, v)| (k.clone(), *v)),
-            successor: successor.map(|(k, v)| (k.clone(), *v)),
-            root: self.root,
-        }
-    }
-
-    fn find_sibling<'a>(
-        &self,
-        key: &[u8],
-        leaves: &[(&'a Vec<u8>, &'a H::Output)],
-        level: usize,
-    ) -> Option<(&'a Vec<u8>, &'a H::Output)> {
-        leaves
-            .iter()
-            .find(|(k, _)| {
-                if k.len() > level && key.len() > level {
-                    k[..level] == key[..level] && k[level] != key[level]
-                } else {
-                    false
-                }
-            })
-            .map(|(k, v)| (*k, *v))
-    }
-
-    fn find_closest_leaf(&self, key: &[u8]) -> Option<(&Vec<u8>, &H::Output)> {
-        self.leaves.iter().min_by_key(|(k, _)| {
-            let common_prefix = self.common_prefix_length(key, k, 0);
-            std::cmp::Reverse(common_prefix)
-        })
-    }
-
-    fn generate_exclusion_proof(
-        &self,
-        query_key: &[u8],
-        closest_key: &[u8],
-        closest_hash: H::Output,
-    ) -> Vec<H::Output> {
-        let common_prefix = self.common_prefix_length(query_key, closest_key, 0);
-        let mut siblings = Vec::new();
-
-        for level in common_prefix.. {
-            if level >= query_key.len() || level >= closest_key.len() {
-                break;
-            }
-
-            if query_key[level] != closest_key[level] {
-                siblings.push(closest_hash);
-                break;
-            }
-        }
-
-        siblings
-    }
-
-    fn find_adjacent_leaves(
-        &self,
-        key: &[u8],
-    ) -> (
-        Option<(&Vec<u8>, &H::Output)>,
-        Option<(&Vec<u8>, &H::Output)>,
-    ) {
-        use std::ops::Bound;
-
-        let key_vec = key.to_vec();
-        let mut predecessor = None;
-        let mut successor = None;
-
-        // Find predecessor (greatest key < query key)
-        for (k, v) in self.leaves.range(..key_vec.clone()).rev().take(1) {
-            predecessor = Some((k, v));
-            break;
-        }
-
-        // Find successor (smallest key > query key)
-        for (k, v) in self
-            .leaves
-            .range((Bound::Excluded(key_vec), Bound::Unbounded))
-            .take(1)
-        {
-            successor = Some((k, v));
-            break;
-        }
-
-        (predecessor, successor)
-    }
-
-    // Cache methods
-    fn get_cached_node(&self, key: &[u8]) -> Option<H::Output> {
-        self.node_cache.get(key).copied()
-    }
-
-    fn cache_node(&mut self, key: Vec<u8>, hash: H::Output) {
-        if self.node_cache.len() >= self.cache_limit {
-            if let Some(random_key) = self.node_cache.keys().next().cloned() {
-                self.node_cache.remove(&random_key);
-            }
-        }
-        self.node_cache.insert(key, hash);
-    }
-
-    fn clear_cache(&mut self) {
-        self.node_cache.clear();
-    }
-
-    // Getters
-    pub fn root(&self) -> H::Output {
-        self.root
-    }
-
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
+    /// Number of committed keys.
+    #[must_use]
     pub fn leaf_count(&self) -> usize {
         self.leaves.len()
     }
 
+    /// Number of committed keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Whether the tree commits to no key at all.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.leaves.is_empty()
     }
-}
 
-// JMTProof implementation
-impl<H: Hasher> JMTProof<H> {
-    pub fn verify<K, V>(&self, root: H::Output, key: K, value: Option<V>) -> bool
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key_ref = key.as_ref();
-        match (&self.leaf, value) {
-            (Some((leaf_key, leaf_hash)), Some(value_data)) => {
-                // Inclusion proof verification
-                if leaf_key != key_ref {
-                    return false;
-                }
+    /// Current root hash.
+    #[must_use]
+    pub fn root(&self) -> H::Output {
+        self.root
+    }
 
-                let computed_hash = H::hash_leaf_with_key(key_ref, value_data.as_ref());
-                if computed_hash != *leaf_hash {
-                    return false;
-                }
+    /// Version tag of the tree.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
 
-                self.verify_siblings(*leaf_hash, root, key_ref)
+    /// Recompute the root from the committed leaves and compare it with the
+    /// cached root — a cheap integrity check after deserialization.
+    #[must_use]
+    pub fn validate(&self) -> bool {
+        self.collapse(None).0 == self.root
+    }
+
+    /// Generate a proof for `key`.
+    ///
+    /// - key present → membership proof,
+    /// - key absent, tree non-empty → non-membership proof bound to the
+    ///   leaf sharing the longest common position prefix with the queried
+    ///   position,
+    /// - empty tree → empty proof.
+    #[must_use]
+    pub fn prove<K: AsRef<[u8]>>(&self, key: K) -> JMTProof<H> {
+        let key = key.as_ref();
+        let commitment = H::commit_key(key);
+        let position = commitment.as_ref();
+        if let Some((stored_key, hash)) = self.leaves.get(position) {
+            return JMTProof {
+                leaf: Some((stored_key.clone(), *hash)),
+                siblings: self.collapse(Some(position)).1,
+            };
+        }
+        // Non-membership: bind the proof to the "closest" existing leaf.
+        let neighbor = self
+            .leaves
+            .iter()
+            .max_by_key(|(leaf_position, _)| lcp_bits(leaf_position, position));
+        if let Some((neighbor_position, (neighbor_key, neighbor_hash))) = neighbor {
+            JMTProof {
+                leaf: Some((neighbor_key.clone(), *neighbor_hash)),
+                siblings: self.collapse(Some(neighbor_position)).1,
             }
-            (Some((leaf_key, leaf_hash)), None) => {
-                // Exclusion proof with existing leaf
-                if leaf_key == key_ref {
-                    return false;
-                }
-                self.verify_siblings(*leaf_hash, root, leaf_key)
+        } else {
+            JMTProof {
+                leaf: None,
+                siblings: Vec::new(),
             }
-            (None, None) => {
-                // Exclusion proof with empty subtree
-                self.verify_siblings(H::empty_hash(), root, key_ref)
-            }
-            (None, Some(_)) => false,
         }
     }
 
-    pub fn verify_enhanced<K, V>(
+    /// Canonical bottom-up fold over all committed leaves.
+    ///
+    /// Returns the root hash and, when `target` is `Some(position)`, the
+    /// sibling chain (`None` for promoted only-children) recorded along the
+    /// way for that target. Entries are processed in position order; two
+    /// adjacent entries sharing their first `depth - level - 1` bits are
+    /// siblings and merge left-first.
+    fn collapse(&self, target: Option<&[u8]>) -> (H::Output, Vec<Option<H::Output>>) {
+        let mut chain = Vec::new();
+        if self.leaves.is_empty() {
+            return (H::empty_hash(), chain);
+        }
+        let mut entries: Vec<(&[u8], H::Output)> = self
+            .leaves
+            .iter()
+            .map(|(position, (_, hash))| (position.as_slice(), *hash))
+            .collect();
+        // A merged node is tracked by its *left* child's position, so when
+        // the target was the right child of a merge it inherits the left
+        // position for the remaining levels.
+        let mut target = target;
+        let depth = entries[0].0.len() * 8;
+        let mut level = 0;
+        while entries.len() > 1 {
+            let shared_bits = depth - level - 1;
+            let mut next: Vec<(&[u8], H::Output)> = Vec::with_capacity(entries.len());
+            let mut i = 0;
+            while i < entries.len() {
+                let current = entries[i];
+                if i + 1 < entries.len() && prefix_eq(current.0, entries[i + 1].0, shared_bits) {
+                    let right = entries[i + 1];
+                    if let Some(tracked) = target {
+                        if current.0 == tracked {
+                            chain.push(Some(right.1));
+                        } else if right.0 == tracked {
+                            chain.push(Some(current.1));
+                            target = Some(current.0);
+                        }
+                    }
+                    let parent = H::hash_internal_node(&[current.1, right.1]);
+                    next.push((current.0, parent));
+                    i += 2;
+                } else {
+                    if let Some(tracked) = target {
+                        if current.0 == tracked {
+                            chain.push(None);
+                        }
+                    }
+                    next.push(current);
+                    i += 1;
+                }
+            }
+            entries = next;
+            level += 1;
+        }
+        (entries[0].1, chain)
+    }
+}
+
+impl<H: Hasher> Default for JellyfishMerkleTree<H> {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl<H: Hasher> Display for JellyfishMerkleTree<H> {
+    /// Renders a summary card; formatting into the intermediate `String`
+    /// cannot fail, so the only fallible operation is the final flush.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut out = alloc::string::String::new();
+        let depth = H::Output::default().as_ref().len() * 8;
+        let root = hex::encode(self.root.as_ref());
+        let _ = writeln!(out, "🎯 Jellyfish Merkle Tree");
+        let _ = writeln!(out, "├── Version: {}", self.version);
+        let _ = writeln!(out, "├── Root: {root}");
+        let _ = writeln!(out, "├── Leaves: {}", self.leaf_count());
+        let _ = writeln!(out, "└── Depth: {depth} bits");
+        f.write_str(&out)
+    }
+}
+
+/// Proof for a [`JellyfishMerkleTree`]: membership, non-membership or
+/// empty-tree, selected implicitly by [`JMTProof::verify`] arguments.
+///
+/// `siblings` has one entry per level from the leaf to the root:
+/// [`Some`] where the proof node had a sibling, [`None`] where it was
+/// promoted as an only child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JMTProof<H: Hasher> {
+    /// The proven leaf: `(key, leaf_hash)`.
+    ///
+    /// [`None`] only for the empty-tree proof.
+    leaf: Option<(Vec<u8>, H::Output)>,
+    /// Sibling hashes, leaf level first; [`None`] marks a promotion level.
+    siblings: Vec<Option<H::Output>>,
+}
+
+impl<H: Hasher> JMTProof<H> {
+    /// Verify the proof against a trusted `root`.
+    ///
+    /// - `value = Some(data)`: membership proof of `key` → `data`;
+    /// - `value = None`: non-membership proof that `key` is absent.
+    #[must_use]
+    pub fn verify<K: AsRef<[u8]>, V: AsRef<[u8]>>(
         &self,
         root: H::Output,
         key: K,
         value: Option<V>,
-        version: u64,
-    ) -> bool
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let key_ref = key.as_ref();
-        if !self.verify(root, key_ref, value.as_ref().map(|v| v.as_ref())) {
+    ) -> bool {
+        let key = key.as_ref();
+        let Some((leaf_key, leaf_hash)) = &self.leaf else {
+            // Empty-tree proof: sound only when nothing could be there.
+            return value.is_none() && self.siblings.is_empty() && root == H::empty_hash();
+        };
+
+        let commitment = H::commit_key(leaf_key);
+        let leaf_position = commitment.as_ref();
+        if self.siblings.len() > leaf_position.len() * 8 {
             return false;
         }
 
-        // Additional security checks
-        if self.siblings.len() > 256 {
-            return false;
-        }
-
-        let expected_path_length = key_ref.len() * 8;
-        if self.siblings.len() > expected_path_length {
-            return false;
-        }
-
-        if let Some((leaf_key, leaf_hash)) = &self.leaf {
-            if value.is_some() && leaf_key != key_ref {
+        if let Some(value) = value {
+            if leaf_key.as_slice() != key {
                 return false;
             }
-
-            if let Some(data) = value {
-                let leaf_data_hash = H::hash_leaf_with_key(key_ref, data.as_ref());
-                let computed_hash = H::hash_with_version(version, leaf_data_hash.as_ref());
-                if computed_hash != *leaf_hash {
-                    return false;
-                }
+            if H::hash_leaf_with_key(key, value.as_ref()) != *leaf_hash {
+                return false;
             }
+            self.fold(leaf_position, *leaf_hash) == root
+        } else if leaf_key.as_slice() == key {
+            // A membership proof can never prove absence.
+            false
+        } else {
+            // Non-membership: the proof commits to a *different* leaf.
+            // Soundness requires that leaf to be the one "shadowing" the
+            // queried key: at the level where the two positions diverge,
+            // the chain must show a *promotion* (no sibling), proving
+            // that the subtree on the queried side is empty. A pair at
+            // that level would mean a closer leaf exists (or the queried
+            // key itself), and the fold alone cannot rule it out.
+            let key_commitment = H::commit_key(key);
+            let key_position = key_commitment.as_ref();
+            let depth = leaf_position.len() * 8;
+            let divergence = lcp_bits(leaf_position, key_position);
+            if divergence == depth {
+                // Identical positions for different keys: the position
+                // is occupied by another key, so `key` cannot be in an
+                // honestly built tree.
+                return self.fold(leaf_position, *leaf_hash) == root;
+            }
+            let divergence_level = depth - 1 - divergence;
+            let promoted = match self.siblings.get(divergence_level) {
+                None | Some(None) => true,
+                Some(Some(_)) => false,
+            };
+            promoted && self.fold(leaf_position, *leaf_hash) == root
         }
-
-        true
     }
 
-    fn verify_siblings(&self, mut current_hash: H::Output, root: H::Output, key: &[u8]) -> bool {
-        let mut level = 0;
-
-        for sibling in &self.siblings {
-            let bit_index = level / 8;
-            let bit_offset = 7 - (level % 8);
-
-            if bit_index < key.len() {
-                let byte = key[bit_index];
-                let is_right = (byte >> bit_offset) & 1 == 1;
-
-                current_hash = if is_right {
-                    H::hash_internal_node(&[*sibling, current_hash])
+    /// Replay the sibling chain from a leaf position up to the root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chain is longer than the position (a forged proof);
+    /// [`JMTProof::verify`] rejects those before folding.
+    fn fold(&self, position: &[u8], mut hash: H::Output) -> H::Output {
+        let depth = position.len() * 8;
+        debug_assert!(self.siblings.len() <= depth);
+        for (level, sibling) in self.siblings.iter().enumerate() {
+            if let Some(sibling) = sibling {
+                // The distinguishing bit of the level: `depth - level - 1`.
+                hash = if bit_msb(position, depth - level - 1) {
+                    H::hash_internal_node(&[*sibling, hash])
                 } else {
-                    H::hash_internal_node(&[current_hash, *sibling])
+                    H::hash_internal_node(&[hash, *sibling])
                 };
-            } else {
-                current_hash = H::hash_internal_node(&[current_hash, *sibling]);
             }
-
-            level += 1;
         }
-
-        current_hash == root
+        hash
     }
 
-    pub fn proof_size(&self) -> usize {
-        std::mem::size_of::<Option<(Vec<u8>, H::Output)>>()
-            + self.siblings.len() * std::mem::size_of::<H::Output>()
+    /// The proven leaf key, if the proof carries one.
+    #[must_use]
+    pub fn leaf_key(&self) -> Option<&[u8]> {
+        self.leaf.as_ref().map(|(key, _)| key.as_slice())
+    }
+
+    /// The proven leaf hash, if the proof carries one.
+    #[must_use]
+    pub fn leaf_hash(&self) -> Option<&H::Output> {
+        self.leaf.as_ref().map(|(_, hash)| hash)
+    }
+
+    /// Number of levels the proof spans.
+    #[must_use]
+    pub fn level_count(&self) -> usize {
+        self.siblings.len()
     }
 }
 
-// JMTNonMembershipProof implementation
-impl<H: Hasher> JMTNonMembershipProof<H> {
-    pub fn verify(&self, root: H::Output) -> bool {
-        if self.root != root {
-            return false;
-        }
-
-        match (&self.predecessor, &self.successor) {
-            (Some((pred_key, _)), Some((succ_key, _))) => {
-                pred_key < &self.key && &self.key < succ_key
+impl<H: Hasher> Display for JMTProof<H>
+where
+    H::Output: AsRef<[u8]>,
+{
+    /// Renders a summary card; formatting into the intermediate `String`
+    /// cannot fail, so the only fallible operation is the final flush.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut out = alloc::string::String::new();
+        let _ = writeln!(out, "🔐 JMT Proof");
+        match &self.leaf {
+            Some((key, hash)) => {
+                let leaf_key = hex::encode(key);
+                let leaf_hash = hex::encode(hash.as_ref());
+                let _ = writeln!(out, "├── Leaf Key: {leaf_key}");
+                let _ = writeln!(out, "├── Leaf Hash: {leaf_hash}");
             }
-            (Some((pred_key, _)), None) => pred_key < &self.key,
-            (None, Some((succ_key, _))) => &self.key < succ_key,
-            (None, None) => true,
+            None => {
+                let _ = writeln!(out, "├── Leaf: (empty tree)");
+            }
         }
+        let present = self.siblings.iter().filter(|s| s.is_some()).count();
+        let _ = writeln!(
+            out,
+            "└── Siblings: {present} of {} levels",
+            self.siblings.len()
+        );
+        f.write_str(&out)
     }
 }
 
-// VersionedJMTStorage implementation
+/// Set of changes applied between two versions of a
+/// [`JellyfishMerkleTree`].
+// bound = "": H itself is never serialized, only its associated Output
+// type, which already carries the serde bounds via the Hasher trait.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct JMTDelta<H: Hasher> {
+    /// Keys inserted (or replaced) in the version, with their leaf hashes.
+    pub inserted: BTreeMap<Vec<u8>, H::Output>,
+    /// Keys removed in the version.
+    pub deleted: BTreeSet<Vec<u8>>,
+}
+
+/// History of [`JellyfishMerkleTree`] roots with per-version deltas,
+/// supporting reconstruction of past versions and compaction.
+///
+/// Reconstruction replays deltas; when old versions are pruned, their
+/// deltas are *compacted* into a cumulative base delta so that newer
+/// versions remain reconstructible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct VersionedJMTStorage<H: Hasher> {
+    /// Cumulative state of every delta folded away by compaction.
+    base: JMTDelta<H>,
+    /// Highest version folded into `base` (0 = nothing folded yet).
+    base_version: u64,
+    /// Root hash per version.
+    trees: BTreeMap<u64, H::Output>,
+    /// Delta per version (deltas start at version 1).
+    deltas: BTreeMap<u64, JMTDelta<H>>,
+    /// Highest version created so far.
+    current_version: u64,
+}
+
 impl<H: Hasher> VersionedJMTStorage<H> {
+    /// Create empty storage starting before version 1.
+    #[must_use]
     pub fn new() -> Self {
         Self {
+            base: JMTDelta {
+                inserted: BTreeMap::new(),
+                deleted: BTreeSet::new(),
+            },
+            base_version: 0,
             trees: BTreeMap::new(),
             deltas: BTreeMap::new(),
             current_version: 0,
-            _hasher: std::marker::PhantomData,
         }
     }
 
+    /// Record `root` as the next version; returns its number.
     pub fn create_new_version(&mut self, root: H::Output) -> u64 {
         self.current_version += 1;
         self.trees.insert(self.current_version, root);
         self.current_version
     }
 
+    /// Record `root` together with the `delta` that produced it; returns
+    /// the version number.
     pub fn create_version_with_delta(&mut self, delta: JMTDelta<H>, root: H::Output) -> u64 {
-        self.current_version += 1;
-        self.trees.insert(self.current_version, root);
-        self.deltas.insert(self.current_version, delta);
-        self.current_version
+        let version = self.create_new_version(root);
+        self.deltas.insert(version, delta);
+        version
     }
 
+    /// Root hash recorded for `version`.
+    #[must_use]
     pub fn get_root(&self, version: u64) -> Option<H::Output> {
         self.trees.get(&version).copied()
     }
 
+    /// Delta recorded for `version`.
+    #[must_use]
     pub fn get_delta(&self, version: u64) -> Option<&JMTDelta<H>> {
         self.deltas.get(&version)
     }
 
-    pub fn reconstruct_tree<const HEIGHT: usize>(
-        &self,
-        version: u64,
-    ) -> Option<JellyfishMerkleTree<HEIGHT, H>> {
-        if version > self.current_version {
-            return None;
+    /// Rebuild the tree state of `version` by replaying the compacted base
+    /// and all deltas up to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JMTError::InvalidVersion`] if the version was never
+    /// recorded, or if any delta needed to replay it is missing (versions
+    /// created without a delta cannot be reconstructed).
+    pub fn reconstruct_tree(&self, version: u64) -> Result<JellyfishMerkleTree<H>, JMTError> {
+        let root = self
+            .get_root(version)
+            .ok_or(JMTError::InvalidVersion(version))?;
+        let mut tree = JellyfishMerkleTree::new(version);
+        for (key, hash) in &self.base.inserted {
+            let commitment = H::commit_key(key);
+            tree.leaves
+                .insert(commitment.as_ref().to_vec(), (key.clone(), *hash));
         }
-
-        let mut tree = JellyfishMerkleTree::<HEIGHT, H>::new(0);
-
-        for v in 1..=version {
-            if let Some(delta) = self.deltas.get(&v) {
-                for (key, value_hash) in &delta.inserted {
-                    tree.leaves.insert(key.clone(), *value_hash);
-                }
-
-                for key in &delta.deleted {
-                    tree.leaves.remove(key);
-                }
+        for v in (self.base_version + 1)..=version {
+            let delta = self.get_delta(v).ok_or(JMTError::InvalidVersion(version))?;
+            for (key, hash) in &delta.inserted {
+                let commitment = H::commit_key(key);
+                tree.leaves
+                    .insert(commitment.as_ref().to_vec(), (key.clone(), *hash));
+            }
+            for key in &delta.deleted {
+                let commitment = H::commit_key(key);
+                tree.leaves.remove(commitment.as_ref());
             }
         }
-
-        tree.root = self.get_root(version)?;
-        tree.version = version;
-
-        Some(tree)
+        tree.root = root;
+        Ok(tree)
     }
 
+    /// Drop the `trees.len() - keep_latest` oldest versions, folding their
+    /// deltas into a cumulative base so the retained versions stay
+    /// reconstructible. Versions at or below the compaction point can no
+    /// longer be reconstructed individually.
     pub fn prune_with_compaction(&mut self, keep_latest: usize) {
         if self.trees.len() <= keep_latest {
             return;
         }
-
-        let versions_to_remove: Vec<u64> = self
-            .trees
-            .keys()
-            .take(self.trees.len() - keep_latest)
-            .cloned()
-            .collect();
-
-        for version in versions_to_remove {
+        let keep_from = self.current_version - keep_latest as u64 + 1;
+        for version in (self.base_version + 1)..keep_from {
+            if let Some(delta) = self.deltas.remove(&version) {
+                for (key, hash) in delta.inserted {
+                    self.base.deleted.remove(&key);
+                    self.base.inserted.insert(key, hash);
+                }
+                for key in delta.deleted {
+                    self.base.inserted.remove(&key);
+                    self.base.deleted.insert(key);
+                }
+                self.base_version = version;
+            }
             self.trees.remove(&version);
-            self.deltas.remove(&version);
         }
+        self.trees.retain(|&version, _| version >= keep_from);
+        self.deltas.retain(|&version, _| version >= keep_from);
     }
 
-    pub fn current_version(&self) -> u64 {
+    /// Highest version number created so far.
+    #[must_use]
+    pub const fn current_version(&self) -> u64 {
         self.current_version
     }
 
+    /// Number of recorded versions.
+    #[must_use]
     pub fn version_count(&self) -> usize {
         self.trees.len()
     }
 }
 
-// Database trait and implementation
+impl<H: Hasher> Default for VersionedJMTStorage<H> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pluggable persistence layer for [`JellyfishMerkleTree`] state.
+///
+/// Implement this over your storage engine (`RocksDB`, `Postgres`, ...) to make
+/// trees and version history durable.
 pub trait JMTDatabase<H: Hasher> {
+    /// Read the root recorded for `version`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
     fn get_root(&self, version: u64) -> Result<Option<H::Output>, JMTError>;
+
+    /// Record the root of `version`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
     fn set_root(&mut self, version: u64, root: H::Output) -> Result<(), JMTError>;
-    fn get_leaf<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<H::Output>, JMTError>;
-    fn set_leaf<K: AsRef<[u8]>>(&mut self, key: K, hash: H::Output) -> Result<(), JMTError>;
-    fn delete_leaf<K: AsRef<[u8]>>(&mut self, key: K) -> Result<bool, JMTError>;
+
+    /// Read the leaf hash committed for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
+    fn get_leaf(&self, key: &[u8]) -> Result<Option<H::Output>, JMTError>;
+
+    /// Commit `hash` for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
+    fn set_leaf(&mut self, key: &[u8], hash: H::Output) -> Result<(), JMTError>;
+
+    /// Remove `key`; returns whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
+    fn delete_leaf(&mut self, key: &[u8]) -> Result<bool, JMTError>;
+
+    /// Read the current version counter.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
     fn get_version(&self) -> Result<u64, JMTError>;
+
+    /// Overwrite the version counter.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined storage failures.
     fn set_version(&mut self, version: u64) -> Result<(), JMTError>;
 }
 
-#[derive(Debug)]
+/// In-memory [`JMTDatabase`] suitable for tests and single-process use.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryJMTDatabase<H: Hasher> {
-    roots: HashMap<u64, H::Output>,
+    /// Root hashes per version.
+    roots: BTreeMap<u64, H::Output>,
+    /// Leaf hashes per key.
     leaves: BTreeMap<Vec<u8>, H::Output>,
+    /// Version counter.
     current_version: u64,
-    _hasher: std::marker::PhantomData<H>,
 }
 
 impl<H: Hasher> MemoryJMTDatabase<H> {
+    /// Create an empty database.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            roots: HashMap::new(),
+            roots: BTreeMap::new(),
             leaves: BTreeMap::new(),
             current_version: 0,
-            _hasher: std::marker::PhantomData,
         }
+    }
+}
+
+impl<H: Hasher> Default for MemoryJMTDatabase<H> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -689,19 +808,17 @@ impl<H: Hasher> JMTDatabase<H> for MemoryJMTDatabase<H> {
         Ok(())
     }
 
-    fn get_leaf<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<H::Output>, JMTError> {
-        let key_vec = key.as_ref().to_vec();
-        Ok(self.leaves.get(&key_vec).copied())
+    fn get_leaf(&self, key: &[u8]) -> Result<Option<H::Output>, JMTError> {
+        Ok(self.leaves.get(key).copied())
     }
 
-    fn set_leaf<K: AsRef<[u8]>>(&mut self, key: K, hash: H::Output) -> Result<(), JMTError> {
-        self.leaves.insert(key.as_ref().to_vec(), hash);
+    fn set_leaf(&mut self, key: &[u8], hash: H::Output) -> Result<(), JMTError> {
+        self.leaves.insert(key.to_vec(), hash);
         Ok(())
     }
 
-    fn delete_leaf<K: AsRef<[u8]>>(&mut self, key: K) -> Result<bool, JMTError> {
-        let key_vec = key.as_ref().to_vec();
-        Ok(self.leaves.remove(&key_vec).is_some())
+    fn delete_leaf(&mut self, key: &[u8]) -> Result<bool, JMTError> {
+        Ok(self.leaves.remove(key).is_some())
     }
 
     fn get_version(&self) -> Result<u64, JMTError> {
@@ -714,321 +831,6 @@ impl<H: Hasher> JMTDatabase<H> for MemoryJMTDatabase<H> {
     }
 }
 
-// Example SHA256 Hasher Implementation with JMT optimizations
-#[derive(Debug, Clone)]
-pub struct Sha256Hasher;
-
-impl Hasher for Sha256Hasher {
-    type Output = [u8; 32];
-
-    fn hash_leaf(data: &[u8]) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"leaf:");
-        hasher.update(data);
-        hasher.finalize().into()
-    }
-
-    fn hash_node(left: &Self::Output, right: &Self::Output) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"node:");
-        hasher.update(left);
-        hasher.update(right);
-        hasher.finalize().into()
-    }
-
-    fn empty_hash() -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"jmt_empty:");
-        hasher.update([0u8; 32]);
-        hasher.finalize().into()
-    }
-
-    fn hash_leaf_with_key(key: &[u8], data: &[u8]) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"leaf:");
-        hasher.update(Self::commit_key(key));
-        hasher.update(data);
-        hasher.finalize().into()
-    }
-
-    fn hash_internal_node(children: &[Self::Output]) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"node:");
-        hasher.update((children.len() as u64).to_le_bytes());
-        for child in children {
-            hasher.update(child);
-        }
-        hasher.finalize().into()
-    }
-
-    fn hash_with_version(version: u64, data: &[u8]) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"version:");
-        hasher.update(version.to_le_bytes());
-        hasher.update(data);
-        hasher.finalize().into()
-    }
-
-    fn commit_key(key: &[u8]) -> Self::Output {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"key_commitment:");
-        hasher.update(key);
-        hasher.finalize().into()
-    }
-}
-
-// Display implementations
-impl<const HEIGHT: usize, H: Hasher> Display for JellyfishMerkleTree<HEIGHT, H>
-where
-    H::Output: AsRef<[u8]>,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "🎯 Jellyfish Merkle Tree")?;
-        writeln!(f, "├── Version: {}", self.version)?;
-        writeln!(f, "├── Root: {}", hex::encode(self.root.as_ref()))?;
-        writeln!(f, "├── Leaves: {}", self.leaf_count())?;
-        writeln!(f, "├── Height: {}", HEIGHT)?;
-        writeln!(f, "└── Cache size: {}", self.node_cache.len())?;
-        Ok(())
-    }
-}
-
-impl<H: Hasher> Display for JMTProof<H>
-where
-    H::Output: AsRef<[u8]>,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "🔐 JMT Proof")?;
-        writeln!(
-            f,
-            "├── Leaf: {}",
-            if self.leaf.is_some() { "Some" } else { "None" }
-        )?;
-        writeln!(f, "├── Siblings: {}", self.siblings.len())?;
-        writeln!(f, "└── Proof size: {} bytes", self.proof_size())?;
-
-        if let Some((key, hash)) = &self.leaf {
-            writeln!(f, "    Leaf Key: {}", hex::encode(key))?;
-            writeln!(f, "    Leaf Hash: {}", hex::encode(hash.as_ref()))?;
-        }
-
-        Ok(())
-    }
-}
-
-// Tests
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_jellyfish_merkle_tree_basic() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-
-        // Test insertion
-        tree.insert(b"key1", b"value1");
-        tree.insert("key2", "value2"); // Using string slices
-
-        assert_eq!(tree.leaf_count(), 2);
-        assert!(tree.contains(b"key1"));
-        assert!(tree.contains("key2")); // Using string slice
-        assert!(!tree.contains(b"key3"));
-
-        // Test retrieval
-        let hash1 = tree.get(b"key1").unwrap();
-        let expected_hash1 = Sha256Hasher::hash_leaf_with_key(b"key1", b"value1");
-        assert_eq!(hash1, expected_hash1);
-
-        // Test update
-        tree.update(b"key1", b"new_value1").unwrap();
-        let new_hash1 = tree.get(b"key1").unwrap();
-        let expected_new_hash1 = Sha256Hasher::hash_leaf_with_key(b"key1", b"new_value1");
-        assert_eq!(new_hash1, expected_new_hash1);
-
-        // Test removal
-        assert!(tree.remove("key2")); // Using string slice
-        assert!(!tree.contains(b"key2"));
-        assert_eq!(tree.leaf_count(), 1);
-    }
-
-    #[test]
-    fn test_jmt_proof_inclusion() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-        tree.insert(b"key1", b"value1");
-        tree.insert(b"key2", b"value2");
-
-        let proof = tree.prove(b"key1");
-        assert!(proof.verify(tree.root(), b"key1", Some(b"value1")));
-        assert!(!proof.verify(tree.root(), b"key1", Some(b"wrong_value")));
-        assert!(!proof.verify(tree.root(), b"key2", Some(b"value2")));
-
-        // Test with string slices
-        assert!(proof.verify(tree.root(), "key1", Some("value1")));
-    }
-
-    #[test]
-    fn test_jmt_proof_exclusion() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-        tree.insert(b"key1", b"value1");
-        tree.insert(b"key3", b"value3");
-
-        let proof = tree.prove(b"key2");
-        assert!(proof.verify(tree.root(), b"key2", None::<&[u8]>));
-
-        // Test with string slice
-        assert!(proof.verify(tree.root(), "key2", None::<&[u8]>));
-    }
-
-    #[test]
-    fn test_jmt_non_membership_proof() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-        tree.insert(b"key1", b"value1");
-        tree.insert(b"key3", b"value3");
-
-        let proof = tree.prove_non_membership_with_range(b"key2");
-        assert!(proof.verify(tree.root()));
-
-        let proof2 = tree.prove_non_membership_with_range("key0"); // Using string slice
-        assert!(proof2.verify(tree.root()));
-
-        let proof3 = tree.prove_non_membership_with_range(b"key4");
-        assert!(proof3.verify(tree.root()));
-    }
-
-    #[test]
-    fn test_batch_operations() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-
-        let items = [
-            (b"key1", b"value1"),
-            (b"key2", b"value2"), // Using string slices
-            (b"key3", b"value3"),
-        ];
-
-        tree.batch_insert(&items);
-        assert_eq!(tree.leaf_count(), 3);
-
-        let keys_to_remove = [b"key1", b"key3"]; // Mixed types
-        let removed = tree.batch_remove(&keys_to_remove);
-        assert_eq!(removed, 2);
-        assert_eq!(tree.leaf_count(), 1);
-        assert!(tree.contains(b"key2"));
-    }
-
-    #[test]
-    fn test_versioned_storage() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut storage = VersionedJMTStorage::<Sha256Hasher>::new();
-
-        // Create version 1
-        let mut tree1 = JMT::new(1);
-        tree1.insert(b"key1", b"value1");
-        storage.create_new_version(tree1.root());
-
-        // Create version 2 with delta
-        let mut tree2 = tree1;
-        tree2.insert(b"key2", b"value2");
-
-        let delta = JMTDelta {
-            inserted: [(b"key2".to_vec(), tree2.get(b"key2").unwrap())]
-                .into_iter()
-                .collect(),
-            deleted: BTreeSet::new(),
-        };
-
-        storage.create_version_with_delta(delta, tree2.root());
-
-        assert_eq!(storage.current_version(), 2);
-        assert_eq!(storage.version_count(), 2);
-
-        // Test reconstruction
-        let reconstructed = storage.reconstruct_tree::<256>(2).unwrap();
-        assert_eq!(reconstructed.root(), tree2.root());
-        assert_eq!(reconstructed.leaf_count(), 2);
-
-        // Test pruning
-        storage.prune_with_compaction(1);
-        assert_eq!(storage.version_count(), 1);
-    }
-
-    #[test]
-    fn test_memory_database() {
-        let mut db = MemoryJMTDatabase::<Sha256Hasher>::new();
-
-        assert!(db.set_root(1, [1u8; 32]).is_ok());
-        assert!(db.set_leaf(b"key1", [2u8; 32]).is_ok());
-        assert!(db.set_leaf("key2", [3u8; 32]).is_ok()); // Using string slice
-
-        assert_eq!(db.get_root(1).unwrap(), Some([1u8; 32]));
-        assert_eq!(db.get_leaf(b"key1").unwrap(), Some([2u8; 32]));
-        assert_eq!(db.get_leaf("key2").unwrap(), Some([3u8; 32])); // Using string slice
-        assert!(db.get_leaf(b"key3").unwrap().is_none());
-
-        assert!(db.delete_leaf(b"key1").unwrap());
-        assert!(db.delete_leaf("key2").unwrap()); // Using string slice
-        assert!(!db.delete_leaf(b"key1").unwrap());
-    }
-
-    #[test]
-    fn test_enhanced_verification() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::new(1);
-        tree.insert(b"key1", b"value1");
-
-        let proof = tree.prove(b"key1");
-        assert!(proof.verify_enhanced(tree.root(), b"key1", Some(b"value1"), 1));
-
-        // Test with string slices
-        assert!(proof.verify_enhanced(tree.root(), "key1", Some("value1"), 1));
-
-        // Test with wrong version
-        assert!(!proof.verify_enhanced(tree.root(), b"key1", Some(b"value1"), 2));
-    }
-
-    #[test]
-    fn test_empty_tree() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let tree = JMT::new(1);
-        assert!(tree.is_empty());
-        assert_eq!(tree.root(), Sha256Hasher::empty_hash());
-        assert_eq!(tree.leaf_count(), 0);
-
-        let proof = tree.prove(b"key1");
-        assert!(proof.verify(tree.root(), b"key1", None::<&[u8]>));
-
-        // Test with string slice
-        assert!(proof.verify(tree.root(), "key1", None::<&[u8]>));
-    }
-
-    #[test]
-    fn test_cache_functionality() {
-        type JMT = JellyfishMerkleTree<256, Sha256Hasher>;
-
-        let mut tree = JMT::with_cache_limit(1, 2);
-        tree.insert(b"key1", b"value1");
-        tree.insert(b"key2", b"value2");
-
-        // Cache should be cleared after update_root
-        assert!(tree.node_cache.is_empty());
-    }
-}
+#[path = "jmt_tests.rs"]
+mod tests;

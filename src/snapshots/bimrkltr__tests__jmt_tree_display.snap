@@ -1,0 +1,9 @@
+---
+source: src/lib.rs
+expression: tree.to_string()
+---
+🎯 Jellyfish Merkle Tree
+├── Version: 1
+├── Root: 074bf7f7156ee21ca3828111f54f98d7da5047eff55fd1002b04454c4383201c
+├── Leaves: 1
+└── Depth: 256 bits

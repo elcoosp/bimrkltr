@@ -1,15 +1,43 @@
 [package]
 name = "bimrkltr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description="A high-performance, compile-time sized Merkle tree implementation for Rust, featuring bidirectional tree support and generic hash functions."
+rust-version = "1.85"
+description = "A high-performance, compile-time sized Merkle tree implementation for Rust, featuring bidirectional tree support and generic hash functions."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/elcoosp/bimrkltr"
+homepage = "https://github.com/elcoosp/bimrkltr"
+documentation = "https://docs.rs/bimrkltr"
+keywords = ["merkle", "tree", "hash", "cryptography", "jellyfish"]
+categories = ["cryptography", "data-structures", "no-std"]
 
 [dependencies]
-sha2 = "0.10.9"
-hex = "0.4.3"
-serde= {version="1", features=["derive"]}
+sha2 = "0.11.1"
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"] }
+
 [dev-dependencies]
-insta = { version = "1.43.2", features = ["yaml"] }
+insta = { version = "1.49.0", features = ["yaml"] }
+proptest = "1.12.0"
+criterion = { version = "0.8.2", features = ["cargo_bench_support"] }
+postcard = { version = "1.1.3", features = ["alloc"], default-features = false }
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = "warn"
+
 [profile.dev.package]
 insta.opt-level = 3
 similar.opt-level = 3
+
+[[bench]]
+name = "tree"
+harness = false

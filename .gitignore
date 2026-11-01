@@ -1,1 +1,7 @@
 /target
+/CHANGELOG.md.bak
+Cargo.lock.bak
+*.snap.new
+coverage*
+*.lcov
+*.profraw

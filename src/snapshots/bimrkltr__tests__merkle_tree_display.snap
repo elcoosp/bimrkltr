@@ -1,9 +1,9 @@
 ---
 source: src/lib.rs
-expression: "format!(\"{}\", tree)"
+expression: tree.to_string()
 ---
 🌳 Merkle Tree (height: 2)
-├── Root: 0000000000000000000000000000000000000000000000000000000000000000
+├── Root: 4080000000000000000000000000000000000000000000000000000000000000
 ├── Leaves: 4
 ├── Total Nodes: 7
 └── First 3 leaves:

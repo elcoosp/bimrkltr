@@ -1,0 +1,62 @@
+name: Release
+
+# Cut a release by pushing a tag:
+#   git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+#
+# The workflow verifies the crate, generates the changelog for this tag with
+# git-cliff, publishes to crates.io (when CARGO_REGISTRY_TOKEN is configured)
+# and creates the GitHub release with the changelog body.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: publish + GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository with full history (git-cliff needs tags)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Verify tests pass
+        run: cargo test --locked
+
+      - name: Verify the package is publishable
+        run: cargo package --locked --allow-dirty --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Generate changelog body for the current tag
+        run: git-cliff --latest --strip all > RELEASE_BODY.md
+
+      - name: Publish to crates.io
+        # Skipped automatically when the secret is not configured.
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          generate_release_notes: false

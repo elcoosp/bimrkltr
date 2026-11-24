@@ -2,7 +2,7 @@
 name = "bimrkltr"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A high-performance, compile-time sized Merkle tree implementation for Rust, featuring bidirectional tree support and generic hash functions."
 license = "MIT"
 readme = "README.md"

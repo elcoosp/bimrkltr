@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.120.0
+      - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - name: Build and test on MSRV
         run: cargo test --locked
@@ -107,7 +107,7 @@ jobs:
           name: lcov.info
           path: lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v8
+        uses: codecov/codecov-action@v5
         with:
           files: lcov.info
           fail_ci_if_error: false

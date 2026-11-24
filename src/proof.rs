@@ -36,7 +36,7 @@ impl<const HEIGHT: usize, H: Hasher> MerkleProof<HEIGHT, H> {
         let mut hash = H::hash_leaf(leaf_data);
         let mut index = self.leaf_index;
         for sibling in &self.path {
-            hash = if index % 2 == 0 {
+            hash = if index.is_multiple_of(2) {
                 // Current node is a left child.
                 H::hash_node(&hash, sibling)
             } else {

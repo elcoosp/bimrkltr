@@ -8,7 +8,7 @@ use bimrkltr::{Hasher, JellyfishMerkleTree, MerkleTree, Sha256Hasher};
 /// Derive a deterministic leaf payload from a seed.
 fn leaf(seed: u32) -> [u8; 32] {
     let mut out = [0_u8; 32];
-    for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+    for (i, chunk) in out.chunks_mut(4).enumerate() {
         let salt = u32::try_from(i).unwrap_or(u32::MAX);
         let mixed = seed
             .wrapping_mul(0x9E37_79B9)

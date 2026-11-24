@@ -192,7 +192,11 @@ impl<const HEIGHT: usize, H: Hasher> MerkleTree<HEIGHT, H> {
         let mut path = [H::Output::default(); HEIGHT];
         let mut pos = Self::LEAF_OFFSET + index;
         for slot in &mut path {
-            let sibling = if pos % 2 == 0 { pos - 1 } else { pos + 1 };
+            let sibling = if pos.is_multiple_of(2) {
+                pos - 1
+            } else {
+                pos + 1
+            };
             *slot = self.nodes[sibling];
             pos = (pos - 1) / 2;
         }

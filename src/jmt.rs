@@ -141,10 +141,10 @@ impl<H: Hasher> JellyfishMerkleTree<H> {
         let key = key.as_ref();
         let commitment = H::commit_key(key);
         let hash = H::hash_leaf_with_key(key, data.as_ref());
-        if let Some((existing, _)) = self.leaves.get(commitment.as_ref()) {
-            if existing.as_slice() != key {
-                return Err(JMTError::KeyCollision(existing.clone()));
-            }
+        if let Some((existing, _)) = self.leaves.get(commitment.as_ref())
+            && existing.as_slice() != key
+        {
+            return Err(JMTError::KeyCollision(existing.clone()));
         }
         self.leaves
             .insert(commitment.as_ref().to_vec(), (key.to_vec(), hash));
@@ -185,18 +185,17 @@ impl<H: Hasher> JellyfishMerkleTree<H> {
             let key = key.as_ref();
             let commitment = H::commit_key(key);
             let position = commitment.as_ref();
-            if let Some((existing, _)) = self.leaves.get(position) {
-                if existing.as_slice() != key {
-                    return Err(JMTError::KeyCollision(existing.clone()));
-                }
+            if let Some((existing, _)) = self.leaves.get(position)
+                && existing.as_slice() != key
+            {
+                return Err(JMTError::KeyCollision(existing.clone()));
             }
             if let Some((_, existing_key, _)) = staged
                 .iter()
                 .find(|(staged_position, _, _)| staged_position.as_slice() == position)
+                && existing_key.as_slice() != key
             {
-                if existing_key.as_slice() != key {
-                    return Err(JMTError::KeyCollision(existing_key.clone()));
-                }
+                return Err(JMTError::KeyCollision(existing_key.clone()));
             }
             let hash = H::hash_leaf_with_key(key, data.as_ref());
             staged.push((position.to_vec(), key.to_vec(), hash));
@@ -370,10 +369,10 @@ impl<H: Hasher> JellyfishMerkleTree<H> {
                     next.push((current.0, parent));
                     i += 2;
                 } else {
-                    if let Some(tracked) = target {
-                        if current.0 == tracked {
-                            chain.push(None);
-                        }
+                    if let Some(tracked) = target
+                        && current.0 == tracked
+                    {
+                        chain.push(None);
                     }
                     next.push(current);
                     i += 1;
